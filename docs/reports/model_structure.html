@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model Structure</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f7f7f5;
+      --surface: #ffffff;
+      --ink: #182126;
+      --muted: #5d686e;
+      --line: #dfe3e2;
+      --accent: #0b6871;
+      --stripe: #f3f7f7;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    main {
+      width: min(960px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 52px 0 80px;
+    }
+
+    h1 {
+      margin: 0 0 38px;
+      font-size: clamp(2rem, 6vw, 3.25rem);
+      line-height: 1;
+      letter-spacing: -0.045em;
+      font-weight: 760;
+    }
+
+    h2 {
+      margin: 42px 0 12px;
+      color: var(--accent);
+      font-size: 1.25rem;
+      line-height: 1.2;
+      letter-spacing: -0.015em;
+      font-weight: 720;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.94rem;
+    }
+
+    th,
+    td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    tr:last-child th,
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tr:nth-child(even) {
+      background: var(--stripe);
+    }
+
+    th {
+      width: 29%;
+      color: var(--muted);
+      font-weight: 640;
+      white-space: nowrap;
+    }
+
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+
+    code {
+      padding: 0.08em 0.28em;
+      border-radius: 4px;
+      background: #eaf1f1;
+      color: #184d53;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 0.9em;
+    }
+
+    @media (max-width: 620px) {
+      main {
+        width: min(100% - 20px, 960px);
+        padding-top: 34px;
+      }
+
+      th {
+        width: 38%;
+        white-space: normal;
+      }
+
+      th,
+      td {
+        padding: 9px 10px;
+      }
+    }
+
+    @media print {
+      body {
+        background: #fff;
+      }
+
+      main {
+        width: 100%;
+        padding: 0;
+      }
+
+      h2 {
+        break-after: avoid;
+      }
+
+      .table-wrap {
+        break-inside: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Model Structure</h1>
+
+    <h2>UNet</h2>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+          <tr>
+            <th scope="row">Input channels</th>
+            <td><code>15</code> = 9 ERA5 + 3 static + 3 climatology</td>
+          </tr>
+          <tr>
+            <th scope="row">Output channels</th>
+            <td><code>3</code> = tmax, tmin, precipitation; no output activation</td>
+          </tr>
+          <tr>
+            <th scope="row">Spatial mode</th>
+            <td><code>192×192</code> training crop; <code>720×1440</code> full-frame inference</td>
+          </tr>
+          <tr>
+            <th scope="row">Architecture</th>
+            <td>2 downsampling stages → bottleneck → 2 upsampling stages</td>
+          </tr>
+          <tr>
+            <th scope="row">Channel widths</th>
+            <td><code>64 → 128 → 128 → 64 → 64</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Residual block</th>
+            <td>GroupNorm(8) → SiLU → 3×3 Conv, repeated twice, with residual projection</td>
+          </tr>
+          <tr>
+            <th scope="row">Down / upsampling</th>
+            <td>4×4 stride-2 Conv / 4×4 stride-2 ConvTranspose; concatenated skip connections</td>
+          </tr>
+          <tr>
+            <th scope="row">Output head</th>
+            <td>GroupNorm(8) → SiLU → 3×3 Conv</td>
+          </tr>
+          <tr>
+            <th scope="row">Parameters</th>
+            <td><code>≈1.6M</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Batch size</th>
+            <td><code>16/rank × 8 ranks = 128 global</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Epochs</th>
+            <td>60 maximum; stopped at 21; best checkpoint at 11</td>
+          </tr>
+          <tr>
+            <th scope="row">Optimization steps</th>
+            <td><code>500/epoch</code>; <code>10,500 total</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Learning rate</th>
+            <td><code>1.5×10<sup>−4</sup></code>; cosine decay; no warmup</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>ViT-crop60</h2>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+          <tr>
+            <th scope="row">Input channels</th>
+            <td><code>15</code> = 9 ERA5 + 3 static + 3 climatology</td>
+          </tr>
+          <tr>
+            <th scope="row">Output channels</th>
+            <td><code>3</code> = tmax, tmin, precipitation; no output activation</td>
+          </tr>
+          <tr>
+            <th scope="row">Spatial mode</th>
+            <td><code>60×60</code> training crop and overlapping tiled inference</td>
+          </tr>
+          <tr>
+            <th scope="row">Patch embedding</th>
+            <td>2×2 stride-2 Conv; <code>30×30 = 900 tokens</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Transformer width</th>
+            <td>Embedding <code>384</code>; <code>8</code> blocks; <code>6</code> heads; head dimension <code>64</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Transformer block</th>
+            <td>Pre-LN global MHSA + residual; Pre-LN MLP + residual</td>
+          </tr>
+          <tr>
+            <th scope="row">MLP</th>
+            <td>Expansion <code>4×</code>; hidden dimension <code>1536</code>; GELU</td>
+          </tr>
+          <tr>
+            <th scope="row">Position encoding</th>
+            <td>Learned; shape <code>1×900×384</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Dropout / DropPath</th>
+            <td><code>0 / 0</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Token upsampling</th>
+            <td>2×2 stride-2 ConvTranspose; <code>384 → 192</code> channels</td>
+          </tr>
+          <tr>
+            <th scope="row">Refinement head</th>
+            <td>Two 3×3 Conv + GELU layers, then 3×3 Conv to 3 outputs</td>
+          </tr>
+          <tr>
+            <th scope="row">Parameters</th>
+            <td><code>≈15.5M</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Batch size</th>
+            <td><code>16/rank × 8 ranks = 128 global</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Epochs</th>
+            <td><code>12</code>; best checkpoint at 12</td>
+          </tr>
+          <tr>
+            <th scope="row">Optimization steps</th>
+            <td><code>500/epoch</code>; <code>6,000 total</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Learning rate</th>
+            <td><code>2×10<sup>−5</sup></code>; 2-epoch warmup + cosine decay</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>ViT-global</h2>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+          <tr>
+            <th scope="row">Input channels</th>
+            <td><code>23</code> = 17 ERA5 + 3 static + 3 climatology</td>
+          </tr>
+          <tr>
+            <th scope="row">Output channels</th>
+            <td><code>3</code> = tmax, tmin, precipitation; no output activation</td>
+          </tr>
+          <tr>
+            <th scope="row">Spatial mode</th>
+            <td><code>720×1440</code> full-frame training and inference</td>
+          </tr>
+          <tr>
+            <th scope="row">Patch embedding</th>
+            <td>2×2 stride-2 Conv; <code>360×720 = 259,200 tokens</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Transformer width</th>
+            <td>Embedding <code>384</code>; <code>8</code> blocks; <code>6</code> heads; head dimension <code>64</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Transformer block</th>
+            <td>Pre-LN full-frame global MHSA + residual; Pre-LN MLP + residual</td>
+          </tr>
+          <tr>
+            <th scope="row">MLP</th>
+            <td>Expansion <code>4×</code>; hidden dimension <code>1536</code>; GELU</td>
+          </tr>
+          <tr>
+            <th scope="row">Position encoding</th>
+            <td>Fixed 2D sin-cos; generated for the full token grid</td>
+          </tr>
+          <tr>
+            <th scope="row">Dropout / DropPath</th>
+            <td><code>0 / 0</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Token upsampling</th>
+            <td>1×1 Conv <code>384 → 768</code> + PixelShuffle ×2 → <code>192</code> channels</td>
+          </tr>
+          <tr>
+            <th scope="row">Refinement head</th>
+            <td>Two 3×3 Conv + GELU layers, then 3×3 Conv to 3 outputs</td>
+          </tr>
+          <tr>
+            <th scope="row">Parameters</th>
+            <td><code>≈15.2M</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Batch size</th>
+            <td><code>1/rank × 128 ranks = 128 global</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Epochs</th>
+            <td><code>17</code>; best checkpoint at 16</td>
+          </tr>
+          <tr>
+            <th scope="row">Optimization steps</th>
+            <td><code>30/epoch</code> from 3,840 frames/epoch; <code>510 total</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Learning rate</th>
+            <td><code>1×10<sup>−5</sup></code>; 5-epoch warmup + cosine decay</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>CorrDiff</h2>
+    <div class="table-wrap">
+      <table>
+        <tbody>
+          <tr>
+            <th scope="row">Overall structure</th>
+            <td>Deterministic regression + conditional residual diffusion</td>
+          </tr>
+          <tr>
+            <th scope="row">Regressor</th>
+            <td>UNet; <code>15 → 3</code>; base <code>64</code>; predicts conditional mean <code>μ</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Diffusion target</th>
+            <td><code>r = truth − μ</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Generator input</th>
+            <td><code>21</code> = noisy residual 3 + condition 15 + <code>μ</code> 3</td>
+          </tr>
+          <tr>
+            <th scope="row">Generator output</th>
+            <td>3-channel residual; final prediction <code>μ + sampled residual</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Generator architecture</th>
+            <td>2-level UNet; base <code>64</code>; same residual, downsampling, upsampling, and skip blocks as UNet</td>
+          </tr>
+          <tr>
+            <th scope="row">Time embedding</th>
+            <td>Sinusoidal embedding; dimension <code>128</code>; MLP injection into every residual block</td>
+          </tr>
+          <tr>
+            <th scope="row">Spatial mode</th>
+            <td><code>192×192</code> training and sampling tiles; 25% overlap with feathered blending</td>
+          </tr>
+          <tr>
+            <th scope="row">EDM parameters</th>
+            <td><code>σdata=0.3603</code>; <code>σmin=0.002</code>; <code>σmax=80</code>; <code>ρ=7</code>; <code>Pmean=−1.2</code>; <code>Pstd=1.2</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Sampling</th>
+            <td>Stochastic second-order EDM; <code>18 steps</code>; <code>16 members</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Parameters</th>
+            <td>Regressor <code>≈1.6M</code> + generator <code>≈1.7M</code> = <code>≈3.3M</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Batch size</th>
+            <td><code>16/rank × 8 ranks = 128 global</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Epochs</th>
+            <td>Generator <code>80</code>, best checkpoint at 73; regressor reused UNet best checkpoint at 11</td>
+          </tr>
+          <tr>
+            <th scope="row">Optimization steps</th>
+            <td>Generator <code>500/epoch</code>, <code>40,000 total</code>; regressor not retrained</td>
+          </tr>
+          <tr>
+            <th scope="row">Learning rate</th>
+            <td>Generator <code>2×10<sup>−4</sup></code>, constant; reused regressor trained at <code>1.5×10<sup>−4</sup></code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>
