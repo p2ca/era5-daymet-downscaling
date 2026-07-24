@@ -1,32 +1,70 @@
-# Diffusion Weather Downscaling (ERA5 → observation product)
+# ERA5–Daymet Downscaling Code Guide
 
-跨产品（cross-product）气象降尺度扩散模型项目。以 **CorrDiff** 为可复现基线，目标是 ERA5 再分析 → 独立观测产品的大分布偏移降尺度。
+本仓库用于代码检查；当前维护的实现集中在 `code/era5_daymet/`。代码主流程为：
 
-## 三端架构（Dropbox / ORNL / 本地）
+`数据匹配与统计 → 模型训练 → 统一评估 → 专项诊断与汇报`
 
-| 端 | 角色 | 说明 |
+## 训练与模型
+
+| 功能 | 代码 | 主要职责 |
 |---|---|---|
-| **Dropbox** | 冷存储（原始数据唯一真相源） | ~50GB、720×1440 每日气象帧；检查点备份 |
-| **本地（这台机器）** | 大脑：写代码/配置、调试、结果分析 | Claude Code 在此协助；无法直连 Dropbox/ORNL |
-| **ORNL（OLCF Frontier）** | 肌肉：预处理 + 训练 + 集合推理 | AMD MI250X；SLURM；数据落 Lustre |
+| 共享训练核心 | `training/train_downscale.py` | 定义数据集与 DataLoader、归一化、UNet 主体、分布式训练、切片推理和公共评估流程 |
+| UNet | `training/train_unet.py` | UNet baseline 的训练入口 |
+| ViT crop / global | `training/train_vit.py` | 定义 ViT、Transformer block、位置编码和上采样结构，并负责 crop 与 full-frame/global 两种训练方式 |
+| CorrDiff | `training/train_corrdiff.py` | 两阶段 CorrDiff：确定性均值模型、残差扩散训练和集合采样 |
+| SCD | `training/train_scd.py` | Scale-Consistent Decomposition 扩散模型训练 |
+| 序列并行注意力 | `models/seq_parallel_attn.py` | global ViT 使用的 sequence-parallel attention、切分/聚合与梯度同步 |
 
-**连接方式**：代码走 Git/GitHub；数据走 rclone（DTN）+ Globus/bbcp；三端不互为副本，各司其职。
+## 数据与统计基线
 
-- 环境事实与路径 → [`docs/reference/ornl-environment.md`](docs/reference/ornl-environment.md)
-- 基线论文 → `oripaper/s43247-025-02042-5.pdf`（CorrDiff）
-- 文献综述 → `overview/Diffusion_Downscaling_Literature_Review.docx`
+| 功能 | 代码 | 主要职责 |
+|---|---|---|
+| ERA5–Daymet 数据匹配 | `data/match_era5_daymet.py` | 查找并按日期配对 ERA5 与 Daymet 文件，定义数据年份划分和匹配流程 |
+| 训练集统计量 | `data/compute_norm_stats.py` | 仅使用训练年份计算均值、标准差和气候态统计量 |
+| 公共数据工具 | `data/downscale_baseline.py` | 提供文件读取、插值、掩膜、单位转换和基础指标等底层函数 |
+| 统计降尺度 baseline | `baselines/train_statistical.py` | 训练并评估插值和 BCSD 等统计方法 |
+| BCSD 系数拟合 | `baselines/fit_bcsd_coefs.py` | 拟合并保存逐网格 BCSD 参数 |
 
-## 单次训练时间估算（基于 CorrDiff）
-锚点：NVIDIA CONUS CorrDiff ≈ 5,000 A100-GPU-小时。本项目 720×1440 面积约为参考 448×448 的 5.2×
-→ 完整运行 **~15,000–30,000 A100-GPU-小时**（128–256 GPU 上数天）。冒烟测试先用 ~10–50 GPU-小时的 mini 配置。
+## 评估
 
-## 当前状态 / 下一步
-- [x] 环境侦察（项目 `atm112`、MI250X/ROCm、SLURM、登录节点+DTN 可上网）
-- [x] 发现学长（patrickfan）已在 world-shared 备好全部数据（100+TB）+ 完整代码
-- [x] 数据来源改为读 Lustre（不再从 Dropbox 下载）；有可复用 ROCm PyTorch 环境 `wea_env`
-- [x] 工作区确认 = `/lustre/orion/atm112/scratch/hjsong/downscaling`
-- [x] 在 Frontier 登录节点架起 tmux 里的 Claude Code（集群内动手）
-- [ ] **阶段 1：跑通 UNet + ViT baseline**（复用学长 `train_unet.py`/`train_vit.py`，cp 到工作区）
-- [ ] **阶段 2：CorrDiff 两阶段**（cnn 均值 + 扩散残差）
+| 功能 | 代码 | 主要职责 |
+|---|---|---|
+| 统一评估工具 | `evaluation/eval_common.py` | 汇总 RMSE、MAE、bias、correlation、CRPS、SSIM、频谱和空间图等公共评估逻辑 |
+| 多模型统一评估 | `evaluation/eval_all_methods.py` | 在相同日期、单位和指标口径下比较统计方法、UNet、ViT 与 CorrDiff |
+| BCSD 双空间评估 | `evaluation/eval_bcsd_both_spaces.py` | 同时在降水物理空间与 `log1p` 空间评估 BCSD |
 
-> 协作规则见 [AGENTS.md](AGENTS.md)，重大历史见 [docs/HISTORY.md](docs/HISTORY.md)，方法背景见 [docs/reference/baseline-pipeline.md](docs/reference/baseline-pipeline.md)。
+## 数据预处理
+
+| 功能 | 代码 |
+|---|---|
+| 将 ERA5 有效区域与 Daymet 网格对齐 | `tools/preprocessing/align_era5_to_daymet.py` |
+| 提取固定样例帧供模型对比 | `tools/preprocessing/extract_golden_frames.py` |
+| 补齐测试集中缺失的 ERA5 最后一天 | `tools/preprocessing/fill_era5_lastday.py` |
+
+## ViT global 诊断
+
+| 功能 | 代码 |
+|---|---|
+| 计算并绘制 ViT crop/global 的网格相位 bias | `tools/diagnostics/diagnose_vit_gridphase_bias.py` |
+| 检查 ViT 网格结构与降水网格结构 | `tools/diagnostics/_eda_vit_grid.py`、`tools/diagnostics/_eda_vit_grid_precip.py` |
+| 检查边界接缝和阶梯状误差 | `tools/diagnostics/_r0_seam_zoom.py`、`tools/diagnostics/_r0_staircase_check.py` |
+| 探测 full-frame ViT 的数据与前向行为 | `tools/diagnostics/_probe_fullframe_vit.py` |
+| 生成全年模型图并补充 ViT global | `tools/diagnostics/_annual_individual_maps.py`、`tools/diagnostics/_annual_vit_global.py` |
+
+## 其他分析、绘图与汇报工具
+
+| 功能 | 代码 |
+|---|---|
+| 数据局部性、误差分解和模型机制分析 | `tools/diagnostics/_eda_task_locality.py`、`_eda_error_decomp.py`、`_eda_bcsd_why.py`、`_eda_corrdiff.py` |
+| 模型上限、频谱和统一诊断 | `tools/diagnostics/_eda_ceiling.py`、`_eda_unified.py` |
+| 全幅降水对比图 | `tools/diagnostics/_full_precip_map.py`、`_full_precip_maps_all_vit.py` |
+| 日常数据与模型结果绘图 | `tools/plotting/` |
+| 汇总评估结果并更新 HTML 指标表 | `tools/reporting/` |
+
+## 分布式测试
+
+`tests/distributed/` 用于验证 sequence parallel 的通信、网格划分、收敛性和 ViT 端到端行为。
+
+## 路径入口
+
+`paths.py` 统一提供代码目录和项目目录定位，供包内工具使用。
