@@ -750,19 +750,24 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
             print(f"[full-frame] epoch_frames={args.epoch_frames} dp_size={dp_size} batch/rank={args.batch} "
                   f"-> steps/epoch={steps}, 全局 batch={dp_size*args.batch}{sp_note}", flush=True)
     # --- val 采样: 逐 epoch 固定 + 按 dp_rank 分片(见 FullFrameDS/ds_worker_init 处的说明) ---
-    # 每 rank 仍跑 val_steps 步(墙钟不变), 但整幅模式下把 val_steps 压到"不重复取帧"的上限,
-    # 使 dp_size x val_steps 个索引落在互不相同的日期上; 覆盖数 = min(dp_size*val_steps, 验证集帧数)。
+    # 整幅模式下取 ceil(验证集帧数 / (dp_size*batch)), 使 dp_size x val_steps 个全局索引覆盖
+    # 整个验证集; 索引超出帧数的部分按固定置换回绕, 那几帧被计入两次(等同 DistributedSampler
+    # 为凑齐每 rank 样本数而做的 padding)。args.val_steps 仍作为每 rank 的步数上限: 并行度不足
+    # 以在该预算内覆盖全集时, 退化为覆盖 dp_size*val_steps 帧的子集。
     val_steps = args.val_steps
     val_pool = sum(va_data.ndays[y] for y in va_data.years)
     if full_frame:
-        val_steps = max(1, min(val_steps, val_pool // max(1, dp_size * args.batch)))
+        val_steps = max(1, min(val_steps, math.ceil(val_pool / max(1, dp_size * args.batch))))
     val_len = val_steps * args.batch
     if is_main:
-        cov = min(val_len * dp_size, val_pool) if full_frame else val_len * dp_size
-        note = f"(请求 {args.val_steps}, 受验证集 {val_pool} 帧上限约束)" if val_steps < args.val_steps else ""
+        drawn = val_len * dp_size
+        cov = min(drawn, val_pool) if full_frame else drawn
+        dup = max(0, drawn - val_pool) if full_frame else 0
+        note = f"(请求 {args.val_steps}, 覆盖全集只需 {val_steps})" if val_steps < args.val_steps else ""
         kind = "帧" if full_frame else "patch"
+        extra = f", 其中 {dup} {kind}因回绕被计两次" if dup else ""
         print(f"[val] dp_size={dp_size} val_steps={val_steps}/rank{note} batch/rank={args.batch} "
-              f"-> 每 epoch 评 {cov} 个不同{kind}(验证集共 {val_pool} 帧), 逐 epoch 固定", flush=True)
+              f"-> 每 epoch 取 {drawn} 次前向, 覆盖 {cov}/{val_pool} {kind}{extra}, 逐 epoch 固定", flush=True)
     if full_frame:
         # 训练: 洗牌无放回的连续流(标准做法; 见 FullFrameDS 文档串)。种子不含 rank —— 置换必须
         # 全 rank 一致, rank 的差异只体现在 index_offset 上, 才能保证分片互不重叠。
