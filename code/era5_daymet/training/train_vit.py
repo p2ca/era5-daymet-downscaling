@@ -188,7 +188,7 @@ def main():
     TD.add_common_args(p)
     # 默认对齐指南 V3_LARGE 的参数预算(~15.2M), 做与 U-Net U3_BASE192(14.2M)公平的同参数量对比。
     # V3 名义超参 = patch2/dim384/depth6/heads12/mlp4(=>15.182M in 指南实现)。但本实现的上采样头更轻
-    # (PixelShuffle+卷积细化头仅~1M, 见 docs/reference/instruction.html 无此层规定), depth=6 只有 11.6M;
+    # (PixelShuffle+卷积细化头仅~1M, 该层不计入规模阶梯定义), depth=6 只有 11.6M;
     # 故 depth 取 8 补回头部差额 -> 15.19M ≈ 指南 V3。其余(dim/heads/patch/mlp)严格取 V3 值。
     p.add_argument("--vit-patch", type=int, default=2, help="patch 边长(V3=2)")
     p.add_argument("--dim", type=int, default=384, help="embedding 维度(V3=384)")

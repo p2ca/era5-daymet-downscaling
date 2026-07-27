@@ -7,7 +7,7 @@ plot_model_maps.py — 会议用: 五模型 + truth 的地图对比 (诊断口�
 ============================================================================
 把 bilinear / BCSD / UNet / ViT / CorrDiff 的预测与 truth 并排画出来, 用来
 ★诚实展示每个方法哪里好、哪里不好, 以及数据本身的特点与难处★
-(历史结论见 docs/archive/results/2026-07-15-results.md)。
+
 
 产出两类图 (每个变量各一套):
   1) --mode case   单日对比。自动挑一个"强降水事件日"(最难的一类), 或 --day 指定。
@@ -46,7 +46,7 @@ from era5_daymet.training import train_corrdiff as CD
 from era5_daymet.training import train_downscale as TD
 from era5_daymet.paths import PROJECT_ROOT
 
-EXTENT = [-125.125, -65.125, 23.625, 53.625]         # 与学长 plot_compare.py 一致
+EXTENT = [-125.125, -65.125, 23.625, 53.625]         # 与 plot_compare.py 一致
 ASPECT = 1.0 / np.cos(np.deg2rad(0.5 * (EXTENT[2] + EXTENT[3])))   # 修正美国经纬比例(≈1.28), 替代 aspect=ASPECT
 PRECIP = TD.PRECIP
 

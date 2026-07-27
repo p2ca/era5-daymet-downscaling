@@ -90,7 +90,7 @@ def build_predictors(methods, test, stats, args, device):
     if "bcsd" in methods:
         # 逐像素线性回归, 系数由 fit_bcsd_coefs.py 预先拟合并存盘(38 年, stride=1)。
         # ★各变量在自己的空间里拟合★: 温度=恒等空间(K), 降水=log1p(mm)。
-        # 降水预测完必须 expm1 反变换回 m/day, 否则与其它方法不可通约(见 AGENTS.md)。
+        # 降水预测完必须 expm1 反变换回 m/day, 否则与其它方法不可通约。
         coefs = {}
         for v in out_vars:
             f = os.path.join(args.bcsd_coef_dir, f"{v}.npz")

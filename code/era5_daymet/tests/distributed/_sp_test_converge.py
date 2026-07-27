@@ -2,7 +2,7 @@
 # Packaged implementation; the original code/ path remains compatible.
 # -*- coding: utf-8 -*-
 """验证"初始权重广播"修复: 2 rank SP(sp_size=2)对单个固定样本做迷你训练, 看 loss 是否随步数下降。
-- 不广播初始权重(模拟 bug): 各 rank 权重不同 -> SP 组内 K/V 混不同权重 -> 前向不连贯 -> loss 卡住。
+- 不广播初始权重: 各 rank 权重不同 -> SP 组内 K/V 混不同权重 -> 前向不连贯 -> loss 卡住。
 - 广播(修复): 权重一致 -> 正常连贯 -> loss 应显著下降。
 运行: python _sp_test_converge.py [bcast=0/1]"""
 import os, sys

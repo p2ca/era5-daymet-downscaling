@@ -6,7 +6,7 @@
 train_corrdiff.py — CorrDiff 复现 (Mardani et al., Comms Earth Env 2025, 6:124)
 ERA5(120x240) -> Daymet(720x1440), 6x, CONUS
 ============================================================================
-论文规格见 docs/reference/corrdiff/paper-notes.md。核心是★两阶段残差分解★(论文式 1):
+核心是★两阶段残差分解★(论文式 1):
 
       x  =  E[x|y]  +  (x - E[x|y])
              └ 回归        └ 生成(扩散)
@@ -71,7 +71,7 @@ TARGETS = TD.TARGETS
 class EDM:
     """Elucidated Diffusion Model。
 
-    ★论文用的不是 EDM 默认值★(docs/reference/corrdiff/paper-notes.md):
+    ★论文用的不是 EDM 默认值★:
         论文: sigma_max=800, P_mean=0.0      理由: "完全摧毁雷达反射率的巨大数据强度"
         默认: sigma_max=80,  P_mean=-1.2
     我们的目标是★归一化距平★(单位方差), 而且残差方差比目标还小 —— 未必需要那么猛的噪声。
@@ -585,7 +585,7 @@ def main():
     p.add_argument("--workers", type=int, default=7)
 
     # EDM —— ★默认走 EDM 标准值, 不是论文值
-    # (论文的大噪声是为雷达重尾定的, 见 docs/reference/corrdiff/paper-notes.md)
+    # (论文的大噪声是为雷达重尾定的)
     p.add_argument("--sigma-data", type=float, default=-1.0,
                    help="<=0 则从残差自动估计(推荐)。EDM preconditioning 全依赖它")
     p.add_argument("--sigma-min", type=float, default=0.002)
@@ -626,7 +626,7 @@ def main():
 
     args.model = "corrdiff"
     if args.smoke:
-        # ★先记下用户显式给的值 —— apply_smoke 会把 out/epochs 覆写掉
+        # ★先记下命令行显式给的值 —— apply_smoke 会把 out/epochs 覆写掉
         user_out = args.out if args.out != DEFAULT_OUT else None
         user_epochs = args.epochs if args.epochs != 40 else None
         TD.apply_smoke(args)

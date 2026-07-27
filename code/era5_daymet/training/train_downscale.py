@@ -73,7 +73,7 @@ def precip_inv(x, scale, max_log=PRECIP_LOG_MAX, return_clipped=False):
     ★必须钳制★: 这是 expm1, 是指数函数。生成式模型(扩散)的样本有重尾, 只要有★一个★
     离群像素(比如 log 空间值 50), expm1(50)≈5e21 就会把整幅图的 RMSE 炸成 inf。
     确定性方法从不触发这个 —— L2 损失把它们的输出压得很平, 永远到不了那个量级 ——
-    所以这个坑直到接入 CorrDiff 才暴露出来。
+    只有生成式模型才会走到需要钳制的区间。
 
     钳到 8.0 对任何真实降水都是无操作(远超世界纪录), 因此不改变任何已记录的确定性结果;
     它只在生成式模型吐出物理上不可能的值时兜底。return_clipped=True 会一并返回被钳的
@@ -83,10 +83,9 @@ def precip_inv(x, scale, max_log=PRECIP_LOG_MAX, return_clipped=False):
     p = np.maximum(np.expm1(np.minimum(x, max_log)), 0.0) / scale
     return (p, n_clip) if return_clipped else p
 
-# ★输入合同(对齐 docs/reference/instruction.html): 17 ERA5 动态变量, ★必须严格按此顺序读取★。
-#   加 3 静态(dz/lc/lsm) => 条件通道 = 17+3 = 20(指南口径, 默认)。
-#   气候态默认删除(指南要求"3 climatology 通道从所有实验中删除")。
-#   --use-clim 可选保留 3 个逐日气候态通道 -> 23 通道(旧口径, 仅用于复现早期 23 通道实验)。
+# ★输入合同: 17 ERA5 动态变量, ★必须严格按此顺序读取★。
+#   加 3 静态(dz/lc/lsm) => 条件通道 = 17+3 = 20(默认)。
+#   --use-clim 可选保留 3 个逐日气候态通道 -> 23 通道(仅用于复现早期 23 通道实验)。
 DEFAULT_IN = ["2m_temperature", "2m_temperature_max", "2m_temperature_min",
               "total_precipitation_24hr", "10m_u_component_of_wind", "10m_v_component_of_wind",
               "volumetric_soil_water_layer_1", "geopotential_500", "geopotential_850",
@@ -214,17 +213,13 @@ class DownscaleData:
 # ===========================================================================
 if torch is not None:
     # --- DataLoader worker 播种 -----------------------------------------------
-    # 修复: PatchDS/FullFrameDS 把 np.random RNG 存在 Dataset 对象里, 且 __getitem__
-    # 不使用索引 i。num_workers>0 时 DataLoader fork 出的每个 worker 会复制同一 RNG
-    # 状态, 从而产生完全重复的采样序列; 非持久 worker 每个 epoch 重新 fork, 序列还会
-    # 逐 epoch 从相同状态重来。full-frame 每 epoch 名义帧数本就少, 该重复尤其严重。
+    # PatchDS/FullFrameDS 的训练路径把 np.random RNG 存在 Dataset 对象里。num_workers>0 时
+    # DataLoader fork 出的每个 worker 会复制同一 RNG 状态, 若不重播种就会产生完全重复的采样
+    # 序列; 非持久 worker 每个 epoch 重新 fork, 序列还会逐 epoch 从相同状态重来。
     # 训练集: 由 ds_worker_init 给每个 (DDP rank, worker, epoch) 重播种成唯一 RNG。
     # 验证集: 用 deterministic=True, 采样只依赖"全局索引 index_offset+i", 因而逐 epoch 完全
-    #         固定(LR 减半/早停判据无采样噪声, 见 docs/investigations/vit-global-failure.md),
-    #         同时由调用方按 dp_rank 给出不重叠的 index_offset -> 各 rank 评不同帧。
-    #   ★2026-07-25 修: 原实现 index_offset 恒为 0, 所有 rank 评的是同一批 val_steps 帧
-    #     (128 卡重复算 128 遍, 冗余 99%), 且整个训练只看过 8 天(缺 6/7/8/10/12 月)。
-    #     分片后墙钟不变, 覆盖的验证日期 x dp_size。
+    #         固定(LR 减半与早停的判据不含采样噪声), 同时由调用方按 dp_rank 给出不重叠的
+    #         index_offset -> 各 rank 评不同帧, 同样墙钟下覆盖的验证日期 x dp_size。
     def ds_worker_init(worker_id):
         info = torch.utils.data.get_worker_info()
         if info is None:

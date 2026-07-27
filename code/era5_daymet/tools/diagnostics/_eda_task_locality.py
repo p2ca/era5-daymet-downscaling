@@ -27,7 +27,7 @@ STATS   = "/lustre/orion/atm112/scratch/hjsong/downscaling/runs/stats/train_dayo
 OUTDIR  = "/lustre/orion/atm112/scratch/hjsong/downscaling/runs/exp/20260720-eda-task-locality"
 YEAR    = 2020
 STRIDE  = 1                       # 1=全年365天(汇报口径); 调大只为快速探索
-                                  # (旧值 30 是"对齐 13 天约定", 那个约定已被证实是失误, 勿再沿用)
+                                  # (stride 必须为 1: 子采样口径不能与全年结果并排)
 BOX     = 384                     # 陆地方框边长(px, 与 eval_spectrum 一致), 6px=1 ERA5格, 60px=tile
 FACTOR  = 6
 VARS    = ["2m_temperature_max", "2m_temperature_min", "total_precipitation_24hr"]

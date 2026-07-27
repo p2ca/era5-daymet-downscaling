@@ -439,7 +439,7 @@ def run(args):
         dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, num_workers=args.workers,
                                          drop_last=True, pin_memory=True, worker_init_fn=TD.ds_worker_init)
         # ★val: 原脚本完全没有验证集 —— 两个阶段都盲跑固定轮数、只存最后一轮。
-        #   而本任务已被证实在 ~ep10 后过拟合(见 docs/archive/results/2026-07-15-results.md),
+        #   而本任务在 ~ep10 后即出现过拟合,
         #   盲跑 40 轮等于故意存一个退化的模型。
         if args.val_steps > 0:
             va_data = TD.DownscaleData(args.era5_dir, args.daymet_dir, args.val_years,

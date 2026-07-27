@@ -5,7 +5,7 @@
 plot_progress_tables.py — 评估指标表格 PNG (分享进展用)
 
 列位置显式锚定 -> 比例字体下数字也严格对齐(微信里用空格对齐必然错位)。
-降水给出两个空间, ★同一份 BCSD 在两个空间里的排名是反的★ —— 见 AGENTS.md。
+降水给出两个空间, ★同一份 BCSD 在两个空间里的排名是反的★。
 
 数据: runs/LEDGER.md + runs/exp/20260713-bcsd-precip-both-spaces/metrics_both_spaces.json
 用法: python code/plot_progress_tables.py [--out runs/progress_tables.png]

@@ -168,7 +168,7 @@ class MultiMethodEval:
                              f"(in physical space most pixels are 0 -> zero local variance -> SSIM inflated by the shared dry area).")
         res["_n_test_days"] = self.nd; res["_eval_stride"] = eval_stride; res["_methods"] = list(self.methods)
         # ── 覆盖率护栏 ─────────────────────────────────────────────────────────
-        # 失误史(2026-07-23): 中期报告误把 stride=30 的 13 天子采样当成完整 test 集汇报。
+        # 子采样评测不是完整 test 集得分, 文件名与提示都必须标出覆盖天数, 避免被当成最终结果。
         # 规则: 只有覆盖完整 test 年(stride==1 且天数==全年)才配叫规范文件名 metrics_{tag}.json;
         # 任何子采样都写成带 __SUBSAMPLED 的另一个文件、盖上 _WARNING、并打醒目横幅,
         # 让它无法冒充"完整 test 集得分"。下游(报告/plot_table)只认规范文件名。

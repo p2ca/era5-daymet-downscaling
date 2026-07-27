@@ -59,7 +59,7 @@ import numpy as np
 warnings.filterwarnings("ignore", category=RuntimeWarning)  # nanmean 全 NaN 切片
 
 # ===========================================================================
-# 0. 用户可改配置  (★ 跑之前请核对这几项 ★)
+# 0. 可改配置  (★ 跑之前请核对这几项 ★)
 # ===========================================================================
 # 默认用"对齐到 Daymet 边界后"的新 ERA5(align_era5_to_daymet.py 的输出)。
 # 想用原始未对齐的, 命令行加: --era5-dir /lustre/.../era5/0.25_deg_Daily_Golden

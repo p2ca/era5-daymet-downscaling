@@ -4,7 +4,7 @@
 """
 eval_bcsd_both_spaces.py — 把 BCSD 的降水成绩同时给出两个空间的分数
 
-背景 (docs/archive/results/2026-07-15-results.md / AGENTS.md):
+背景:
   降水被两套代码在两种空间评测过, RMSE 之间没有换算关系, 跨空间比较 = 假结论。
     train_statistical.py (BCSD)          -> log1p(mm)
     eval_all_methods.py / train_unet.py  -> 原生 m/day
