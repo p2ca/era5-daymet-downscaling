@@ -1,0 +1,13 @@
+# 实验产物与运行数据 —— 体积远超仓库可承受范围, 且属于本地资产
+runs/
+logs/
+oripaper/
+
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# 编辑器/系统临时文件
+.DS_Store
+*.swp
+*~

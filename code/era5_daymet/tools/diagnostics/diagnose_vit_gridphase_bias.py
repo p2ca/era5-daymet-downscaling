@@ -111,17 +111,29 @@ def draw_panel(
     title: str,
     unit: str,
     std: float,
+    bound: float,
+    mean_bias: float | None = None,
     ratio: float | None = None,
 ) -> None:
-    bound = max(float(np.abs(field).max()), np.finfo(float).eps)
     image = axis.imshow(field, cmap="RdBu_r", vmin=-bound, vmax=bound, origin="upper")
     for i in range(field.shape[0]):
         for j in range(field.shape[1]):
-            axis.text(j, i, f"{field[i, j]:+.3f}", ha="center", va="center", fontsize=7)
-    suffix = f"std={std:.4f} {unit}"
+            text_color = "white" if abs(field[i, j]) > 0.58 * bound else "black"
+            axis.text(
+                j,
+                i,
+                f"{field[i, j]:+.3f}",
+                ha="center",
+                va="center",
+                fontsize=7,
+                color=text_color,
+            )
+    suffix = f"phase std={std:.4f} {unit}"
+    if mean_bias is not None:
+        suffix = f"mean bias={mean_bias:+.4f} {unit}; {suffix}"
     if ratio is not None:
-        suffix += f" ({ratio:.2f}% of mean|bias|)"
-    axis.set_title(f"{title}\n{suffix}", fontsize=10)
+        suffix += f" ({ratio:.2f}% of mean |error|)"
+    axis.set_title(f"{title}\n{suffix}", fontsize=9.5)
     axis.set_xlabel("x mod period")
     axis.set_ylabel("y mod period")
     axis.set_xticks(range(field.shape[1]))
@@ -135,6 +147,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--json", type=Path, default=DEFAULT_JSON)
     parser.add_argument("--period", type=int, default=6)
+    parser.add_argument(
+        "--sampling-label",
+        help="Explicit provenance label for legacy NPZ files without sampling metadata",
+    )
     args = parser.parse_args()
 
     cached = np.load(args.input)
@@ -148,8 +164,10 @@ def main() -> None:
     # ★口径标注跟随源 npz 的元数据(_stride/_ndays), 不再写死 -> 图/JSON 永远与数据一致
     cstride = int(cached["_stride"]) if "_stride" in cached.files else None
     cnd = int(cached["_ndays"]) if "_ndays" in cached.files else None
-    if cstride is None:
-        sampling = "unknown (源 npz 无口径元数据; 请重跑 _annual_individual_maps.py)"
+    if args.sampling_label:
+        sampling = args.sampling_label
+    elif cstride is None:
+        sampling = "sampling unknown (source NPZ has no embedded metadata)"
     elif cstride == 1:
         sampling = f"2020 full year (stride=1, {cnd} days)"
     else:
@@ -176,20 +194,35 @@ def main() -> None:
         results["methods"][method] = method_result
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(3, 3, figsize=(15.5, 14.0), constrained_layout=True)
+    fig, axes = plt.subplots(4, 3, figsize=(15.5, 18.0), constrained_layout=True)
     rows = (
         ("vit_global", "phase", "ViT-global: raw phase mean"),
+        ("vit_c60", "phase", "ViT-crop60: raw phase mean"),
         ("vit_global", "demeaned", "ViT-global: block-demeaned"),
         ("vit_c60", "demeaned", "ViT-crop60: block-demeaned"),
     )
+
+    # A shared scale makes the global/crop comparison visually quantitative.
+    # Raw and block-demeaned panels retain separate scales because they answer
+    # different questions and differ greatly in magnitude.
+    shared_bounds: dict[tuple[str, str], float] = {}
+    for kind in ("phase", "demeaned"):
+        for name, _unit, _scale in VARIABLES:
+            shared_bounds[(kind, name)] = max(
+                float(np.abs(matrices[(method, name, kind)]).max())
+                for method in methods
+            )
+
     for row, (method, kind, label) in enumerate(rows):
         for col, (name, unit, _scale) in enumerate(VARIABLES):
             stats = results["methods"][method][name]
             if kind == "phase":
                 std = stats["phase_mean_std"]
+                mean_bias = stats["spatial_mean_bias"]
                 ratio = stats["phase_mean_std_pct_of_mean_abs_bias"]
             else:
                 std = stats["block_demeaned_phase_std"]
+                mean_bias = None
                 ratio = None
             draw_panel(
                 axes[row, col],
@@ -197,12 +230,16 @@ def main() -> None:
                 f"{label} — {name}",
                 unit,
                 std,
+                max(shared_bounds[(kind, name)], np.finfo(float).eps),
+                mean_bias,
                 ratio,
             )
     fig.suptitle(
         f"Grid-phase diagnostic, period={args.period}; {sampling} mean over land\n"
-        "I(i,j)=avg(pred−truth | y mod p=i, x mod p=j)",
-        fontsize=14,
+        "Raw: I(i,j)=avg(pred−truth | y mod p=i, x mod p=j). "
+        "Block-demeaned: subtract each complete land-only block mean first.\n"
+        "ViT-global and ViT-crop60 share color limits within each variable and diagnostic.",
+        fontsize=13,
     )
     fig.savefig(args.output, dpi=160)
     plt.close(fig)

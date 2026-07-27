@@ -81,7 +81,7 @@ def best_idx(rows, key):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default="runs/exp/20260715-meeting-maps/table_6methods.png")
+    p.add_argument("--out", default=os.path.join(ROOT, "runs/exp/20260715-meeting-maps/table_6methods.png"))
     p.add_argument("--det", default=DET, help="确定性方法指标 json(bilinear/.../unet/vit)")
     p.add_argument("--cd", default=CD, help="CorrDiff 指标 json")
     a = p.parse_args()

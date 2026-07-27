@@ -36,6 +36,7 @@ from era5_daymet.evaluation import eval_common as EC
 from era5_daymet.training import train_downscale as TD
 from era5_daymet.training import train_scd as SCD
 from era5_daymet.training import train_vit as VM
+from era5_daymet.paths import PROJECT_ROOT
 
 try:
     import torch
@@ -65,7 +66,7 @@ def _resolve_ckpt(method, args):
 def build_predictors(methods, test, stats, args, device):
     """返回 {method: fn(cond, t) -> members (N,Cout,H,W) 物理量}。"""
     y = args.test_year; out_vars = args.out_vars; Cout = len(out_vars)
-    Cin = len(args.in_vars) + 3 + Cout
+    Cin = TD.cond_channels(args.in_vars, out_vars, getattr(args, "use_clim", True))
     dstd = stats.d_std[:, None, None]; dmean = stats.d_mean[:, None, None]
     up_bl = DB.make_bilinear(test.Hl, test.Wl, TD.FACTOR)
     up_bc = DB.make_bicubic(test.Hl, test.Wl, TD.FACTOR)
@@ -204,7 +205,8 @@ def run(args):
     methods = available(args.methods, args)
     if not methods:
         sys.exit("没有可评测的方法。")
-    # 若有 NN/SCD ckpt, 用其训练时的 in/out vars 以防通道不匹配
+    # 若有 NN/SCD ckpt, 用其训练时的 in/out vars + 气候态口径以防通道不匹配
+    args.use_clim = False                                 # 无 ckpt(纯插值)时的默认(20通道口径, cond 不被插值用)
     for m in methods:
         ckpt = None
         if m in ("unet", "vit"):
@@ -215,11 +217,12 @@ def run(args):
             a = _load_ckpt_args(ckpt)
             if a.get("in_vars"):
                 args.in_vars = a["in_vars"]; args.out_vars = a["out_vars"]
+            args.use_clim = a.get("use_clim", True)       # 旧 ckpt 无此键=23通道(True); 新 ckpt 存实际值
             break
 
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
     test = TD.DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year],
-                            args.in_vars, args.out_vars, stats)
+                            args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
     y = args.test_year; days = list(range(0, test.ndays[y], args.eval_stride))
     print(f"评测方法={methods}  test={y}  天数={len(days)}(stride={args.eval_stride})  device={device}", flush=True)
 
@@ -245,13 +248,13 @@ def main():
     p.add_argument("--in-vars", nargs="+", default=TD.DEFAULT_IN)
     p.add_argument("--out-vars", nargs="+", default=TD.TARGETS)
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])
-    p.add_argument("--unet-dir", default="runs/unet", help="train_unet.py 的输出目录(找 ckpt.pt)")
-    p.add_argument("--vit-dir", default="runs/vit", help="train_vit.py 的输出目录(找 ckpt.pt)")
-    p.add_argument("--base-dir", default="runs/base", help="旧布局兼容: unet.pt / vit.pt 所在目录")
-    p.add_argument("--scd-dir", default="runs/scd", help="corrector.pt / generator.pt 所在目录")
-    p.add_argument("--bcsd-coef-dir", default="runs/bcsd_coefs",
+    p.add_argument("--unet-dir", default=str(PROJECT_ROOT / "runs/unet"), help="train_unet.py 的输出目录(找 ckpt.pt)")
+    p.add_argument("--vit-dir", default=str(PROJECT_ROOT / "runs/vit"), help="train_vit.py 的输出目录(找 ckpt.pt)")
+    p.add_argument("--base-dir", default=str(PROJECT_ROOT / "runs/base"), help="旧布局兼容: unet.pt / vit.pt 所在目录")
+    p.add_argument("--scd-dir", default=str(PROJECT_ROOT / "runs/scd"), help="corrector.pt / generator.pt 所在目录")
+    p.add_argument("--bcsd-coef-dir", default=str(PROJECT_ROOT / "runs/bcsd_coefs"),
                    help="BCSD 逐像素系数 {var}.npz 所在目录 (由 fit_bcsd_coefs.py 生成)")
-    p.add_argument("--out", default="runs/compare_all")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "runs/compare_all"))
     p.add_argument("--ensemble", type=int, default=16, help="SCD 集合成员数")
     p.add_argument("--eval-stride", type=int, default=1, help="1=完整 2020")
     p.add_argument("--smoke", action="store_true")

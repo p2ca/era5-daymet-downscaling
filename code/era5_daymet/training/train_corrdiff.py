@@ -51,6 +51,10 @@ import numpy as np
 
 from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.training import train_downscale as TD
+from era5_daymet.paths import PROJECT_ROOT
+
+# 输出目录默认值(相对仓库根锚定, 从任何 cwd 运行都写入正式 runs/); 下方 sentinel 比较也用它, 保持同步
+DEFAULT_OUT = str(PROJECT_ROOT / "runs/exp/corrdiff")
 
 torch = TD.torch
 if torch is not None:
@@ -386,7 +390,7 @@ def tiled_sample(gen, edm, cond, mu, landmask, Cout, tile, ensemble, steps, stoc
 def evaluate(regressor, gen, edm, stats, args, device):
     from era5_daymet.evaluation import eval_common as EC
     test = TD.DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year],
-                            args.in_vars, args.out_vars, stats)
+                            args.in_vars, args.out_vars, stats, use_clim=getattr(args, "use_clim", False))
     regressor.eval(); gen.eval()
     y = args.test_year; Cout = len(args.out_vars)
     days = list(range(0, test.ndays[y], args.eval_stride))
@@ -448,7 +452,7 @@ def run(args):
 
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
     Cout = len(args.out_vars)
-    Cin = len(args.in_vars) + 3 + Cout                          # baseline 条件通道(15)
+    Cin = TD.cond_channels(args.in_vars, args.out_vars, args.use_clim)   # 默认20通道; --use-clim=23
 
     # 回归器: 与 train_unet.py 完全同构 -> 可直接载入已训好的 ckpt
     regressor = TD.UNet(Cin, Cout, base=args.reg_base, temb=0).to(device)
@@ -469,15 +473,20 @@ def run(args):
     dl = va_dl = None
     if not args.eval_only:
         tr = TD.DownscaleData(args.era5_dir, args.daymet_dir, args.train_years,
-                              args.in_vars, args.out_vars, stats)
+                              args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
         va = TD.DownscaleData(args.era5_dir, args.daymet_dir, args.val_years,
-                              args.in_vars, args.out_vars, stats)
+                              args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
         dl = torch.utils.data.DataLoader(
             TD.PatchDS(tr, args.patch, args.steps_per_epoch * args.batch, seed=1234 + rank),
-            batch_size=args.batch, num_workers=args.workers, drop_last=True, pin_memory=True)
+            batch_size=args.batch, num_workers=args.workers, drop_last=True, pin_memory=True,
+            worker_init_fn=TD.ds_worker_init)
+        # val: 逐 epoch 固定(不含采样噪声), 但按 rank 分片 -> 各卡评不同 patch, 墙钟不变、覆盖 x world
+        # (与 train_downscale.fit_deterministic 同一口径; 修正前所有 rank 评的是同一批 patch)
         va_dl = torch.utils.data.DataLoader(
-            TD.PatchDS(va, args.patch, args.val_steps * args.batch, seed=987),
-            batch_size=args.batch, num_workers=max(1, args.workers // 2), drop_last=True)
+            TD.PatchDS(va, args.patch, args.val_steps * args.batch, seed=987, deterministic=True,
+                       index_offset=rank * args.val_steps * args.batch),
+            batch_size=args.batch, num_workers=max(1, args.workers // 2), drop_last=True,
+            worker_init_fn=TD.ds_worker_init)
 
     # ---- 阶段一: 回归器 (可复用已训好的 UNet, 省一次训练) ----
     if args.regressor_ckpt:
@@ -547,10 +556,12 @@ def main():
     p.add_argument("--stats-dir", default="stats_train")
     p.add_argument("--in-vars", nargs="+", default=TD.DEFAULT_IN)
     p.add_argument("--out-vars", nargs="+", default=TARGETS)
+    p.add_argument("--use-clim", action="store_true",
+                   help="保留 3 个逐日气候态条件通道 -> 23 通道(旧口径); 默认关=20 通道(指南口径)")
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["train"])
     p.add_argument("--val-years", type=int, nargs="+", default=M.splits["val"])
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])
-    p.add_argument("--out", default="runs/exp/corrdiff")
+    p.add_argument("--out", default=DEFAULT_OUT)
     p.add_argument("--regressor-ckpt", default="",
                    help="复用已训好的 UNet 当回归器(如 runs/exp/20260711-unet-b64/ckpt.pt), 跳过阶段一")
 
@@ -616,7 +627,7 @@ def main():
     args.model = "corrdiff"
     if args.smoke:
         # ★先记下用户显式给的值 —— apply_smoke 会把 out/epochs 覆写掉
-        user_out = args.out if args.out != "runs/exp/corrdiff" else None
+        user_out = args.out if args.out != DEFAULT_OUT else None
         user_epochs = args.epochs if args.epochs != 40 else None
         TD.apply_smoke(args)
         if user_out:

@@ -31,6 +31,7 @@ import time
 import numpy as np
 
 from era5_daymet.data import match_era5_daymet as M
+from era5_daymet.paths import PROJECT_ROOT
 from era5_daymet.data.downscale_baseline import (
     Acc,
     FACTOR,
@@ -75,7 +76,7 @@ def main():
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["train"])
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])
     p.add_argument("--train-stride", type=int, default=1)
-    p.add_argument("--out", default="runs/exp/bcsd-both-spaces")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "runs/exp/bcsd-both-spaces"))
     a = p.parse_args()
 
     var = PRECIP

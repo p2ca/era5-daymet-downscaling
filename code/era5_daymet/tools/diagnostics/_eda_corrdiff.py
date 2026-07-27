@@ -20,7 +20,9 @@ from era5_daymet.training import train_downscale as TD
 
 W = "/lustre/orion/atm112/scratch/hjsong/downscaling"
 OUTDIR = f"{W}/runs/exp/20260720-eda-corrdiff"
-YEAR = 2020; DAYS = [9, 100, 190, 280]; NMEM = 12; BOX = 384
+# DAYS 覆盖全年(汇报口径, stride=1)。★注意: 每天做 NMEM 成员 corrdiff 集合采样, 全年非常贵;
+# 快速探索可临时改回少数代表日(如 [9,100,190,280] 覆盖四季), 但不可作为全年汇报。
+YEAR = 2020; DAYS = list(range(0, 365)); NMEM = 12; BOX = 384
 PRECIP = TD.PRECIP
 os.makedirs(OUTDIR, exist_ok=True)
 logmm = lambda x: np.log1p(np.maximum(x, 0.0) * 1000.0)

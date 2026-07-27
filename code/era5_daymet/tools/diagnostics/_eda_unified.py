@@ -19,7 +19,9 @@ from era5_daymet.training import train_downscale as TD
 
 W = "/lustre/orion/atm112/scratch/hjsong/downscaling"
 OUTDIR = f"{W}/runs/exp/20260720-eda-unified"
-YEAR = 2020; DAYS = list(range(0, 365, 40)); NMEM = 8; BOX = 384; FACTOR = 6
+# DAYS 覆盖全年(汇报口径, stride=1)。★注意: 每天要做 NMEM 成员 corrdiff 集合采样, 全年很贵;
+# 快速探索可临时改回 list(range(0, 365, 40)) 之类的子采样(但结果不可作为全年汇报)。
+YEAR = 2020; DAYS = list(range(0, 365)); NMEM = 8; BOX = 384; FACTOR = 6
 PRECIP = TD.PRECIP
 TVARS = ["2m_temperature_max", "2m_temperature_min", PRECIP]
 LAB = {"2m_temperature_max": "tmax (K)", "2m_temperature_min": "tmin (K)", PRECIP: "precip  log1p(mm)"}

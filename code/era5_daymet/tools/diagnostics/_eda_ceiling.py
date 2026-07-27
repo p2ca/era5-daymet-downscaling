@@ -18,7 +18,8 @@ from era5_daymet.training import train_downscale as TD
 
 W = "/lustre/orion/atm112/scratch/hjsong/downscaling"
 OUTDIR = f"{W}/runs/exp/20260720-eda-ceiling"
-YEAR = 2020; DAYS = list(range(0, 365, 45)); BOX = 384; SIGMA = 6
+# DAYS 覆盖全年(汇报口径, stride=1); 只用确定性方法, 全年不贵。快速探索可临时改回 range(0,365,45) 之类。
+YEAR = 2020; DAYS = list(range(0, 365)); BOX = 384; SIGMA = 6
 PRECIP = TD.PRECIP
 os.makedirs(OUTDIR, exist_ok=True)
 logmm = lambda x: np.log1p(np.maximum(x, 0.0) * 1000.0)

@@ -24,6 +24,8 @@ matplotlib.use("Agg")
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 
+from era5_daymet.paths import PROJECT_ROOT
+
 FONT = os.path.expanduser("~/.fonts/NotoSansSC-Regular.otf")
 if os.path.exists(FONT):
     fm.fontManager.addfont(FONT)
@@ -57,7 +59,7 @@ PANELS = [
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default="runs/progress_summary.png")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "runs/progress_summary.png"))
     a = p.parse_args()
 
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.4), facecolor=SURFACE)

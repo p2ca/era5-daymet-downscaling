@@ -43,6 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from era5_daymet.data import match_era5_daymet as M
+from era5_daymet.paths import PROJECT_ROOT
 from era5_daymet.data.downscale_baseline import (
     Acc,
     FACTOR,
@@ -177,7 +178,7 @@ def main():
     ap.add_argument("--vars", nargs="+", default=M.CHECK_VARS)
     ap.add_argument("--era5-dir", default=M.ERA5_DIR)
     ap.add_argument("--daymet-dir", default=M.DAYMET_DIR)
-    ap.add_argument("--out", default="runs/stat")
+    ap.add_argument("--out", default=str(PROJECT_ROOT / "runs/stat"))
     ap.add_argument("--train-years", type=int, nargs="+", default=M.splits["train"], help="拟合 BCSD 的年(默认 1980-2017)")
     ap.add_argument("--test-year", type=int, default=M.splits["test"][0], help="评测年(默认 2020)")
     ap.add_argument("--train-stride", type=int, default=1, help="训练天下采样(>1 更快, 略降精度)")

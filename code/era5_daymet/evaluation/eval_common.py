@@ -92,13 +92,14 @@ class MultiMethodEval:
         mb = (mask[0] if mask.ndim == 3 else mask) > 0.5
         if self.box is None:
             self.box = TD.pick_land_box(mb, min(384, self.H, self.W))
-            by, bx, bs = self.box
-            self.spec["truth"] = {v: TD.radial_psd(hr[i][by:by+bs, bx:bx+bs], bs)
-                                  for i, v in enumerate(self.ov)}
+            # ★功率谱改为★全年累加求平均★(不再只取首日快照); 首日把累加器初始化为 0
+            self.spec["truth"] = {v: 0.0 for v in self.ov}
         if self.mb_er is None:
             self.mb_er = binary_erosion(mb, iterations=SSIM_ERODE)
         by, bx, bs = self.box; first = (self.nd == 0)
         self.tsum += hr; self.nd += 1
+        for i, v in enumerate(self.ov):                          # 累加 truth 功率谱(全年平均, _plots 里除以 nd)
+            self.spec["truth"][v] = self.spec["truth"][v] + TD.radial_psd(hr[i][by:by+bs, bx:bx+bs], bs)
         pi = self.ov.index(PRECIP) if PRECIP in self.ov else None
         lg = lambda a: np.log1p(np.maximum(a, 0) * self.pscale)   # 物理量 -> log1p(mm)
         for m in self.methods:
@@ -120,10 +121,11 @@ class MultiMethodEval:
                 self.ssim_log[m][0] += s; self.ssim_log[m][1] += 1
             if mem.shape[0] > 1:
                 self.rh[m].append(TD.rank_hist(mem, hr, (mask[0] if mask.ndim == 3 else mask)))
-            if first:
-                self.spec[m] = {v: {"mean": TD.radial_psd(ens[i][by:by+bs, bx:bx+bs], bs),
-                                    "member": TD.radial_psd(mem[0, i][by:by+bs, bx:bx+bs], bs)}
-                                for i, v in enumerate(self.ov)}
+            if m not in self.spec:                               # 首次见到该方法 -> 初始化功率谱累加器
+                self.spec[m] = {v: {"mean": 0.0, "member": 0.0} for v in self.ov}
+            for i, v in enumerate(self.ov):                      # 累加方法功率谱(全年平均)
+                self.spec[m][v]["mean"] = self.spec[m][v]["mean"] + TD.radial_psd(ens[i][by:by+bs, bx:bx+bs], bs)
+                self.spec[m][v]["member"] = self.spec[m][v]["member"] + TD.radial_psd(mem[0, i][by:by+bs, bx:bx+bs], bs)
 
     # -------------------------------------------------------------------
     def finalize(self, out_dir, test_year, eval_stride=1, tag="all", n_total_days=None,
@@ -245,17 +247,18 @@ class MultiMethodEval:
             print(f"(无 matplotlib, 跳过画图: {e})"); return
         cmap_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
         by, bx, bs = self.box; k = np.arange(1, bs // 2)
+        nd = max(self.nd, 1)                                       # 功率谱是全年累加 -> 除以天数得平均
 
-        # (a) 逐变量功率谱: truth(黑) + 各方法均值(实线); 集合方法额外画单成员(虚线)
+        # (a) 逐变量功率谱(全年平均): truth(黑) + 各方法均值(实线); 集合方法额外画单成员(虚线)
         fig, axes = plt.subplots(1, self.Cout, figsize=(5.2 * self.Cout, 4.3), squeeze=False)
         for i, v in enumerate(self.ov):
             ax = axes[0, i]
-            ax.loglog(k, self.spec["truth"][v][1:bs // 2], "k-", lw=2.4, label="truth")
+            ax.loglog(k, (self.spec["truth"][v] / nd)[1:bs // 2], "k-", lw=2.4, label="truth")
             for j, m in enumerate(self.methods):
                 col = cmap_cycle[j % len(cmap_cycle)]
-                ax.loglog(k, self.spec[m][v]["mean"][1:bs // 2], "-", color=col, label=f"{m} (mean)")
+                ax.loglog(k, (self.spec[m][v]["mean"] / nd)[1:bs // 2], "-", color=col, label=f"{m} (mean)")
                 if self.N[m] > 1:
-                    ax.loglog(k, self.spec[m][v]["member"][1:bs // 2], "--", color=col, alpha=.7, label=f"{m} (member)")
+                    ax.loglog(k, (self.spec[m][v]["member"] / nd)[1:bs // 2], "--", color=col, alpha=.7, label=f"{m} (member)")
             ax.set_xlabel("radial wavenumber"); ax.set_ylabel("power"); ax.set_title(v)
             ax.grid(True, which="both", alpha=.3)
             if i == 0:

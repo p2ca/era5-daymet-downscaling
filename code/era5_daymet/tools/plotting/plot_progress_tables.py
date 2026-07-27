@@ -18,6 +18,8 @@ matplotlib.use("Agg")
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 
+from era5_daymet.paths import PROJECT_ROOT
+
 FONT = os.path.expanduser("~/.fonts/NotoSansSC-Regular.otf")
 if os.path.exists(FONT):
     fm.fontManager.addfont(FONT)
@@ -70,7 +72,7 @@ NOTE = [
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default="runs/progress_tables.png")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "runs/progress_tables.png"))
     a = p.parse_args()
 
     fig = plt.figure(figsize=(8.0, 11.2), facecolor=BG)

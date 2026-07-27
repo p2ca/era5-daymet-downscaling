@@ -19,10 +19,12 @@ import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.data.downscale_baseline import make_bilinear
 from era5_daymet.training import train_downscale as TD
+from era5_daymet.paths import PROJECT_ROOT
 
-STATS  = "runs/stats/train_dayofyear"
-COEFS  = "runs/bcsd_coefs"
-OUTDIR = "runs/exp/20260720-eda-bcsd-why"
+# 路径一律相对仓库根锚定, 从任何 cwd 运行都写入正式 runs/ (不再在 code/ 下误建目录)
+STATS  = str(PROJECT_ROOT / "runs/stats/train_dayofyear")
+COEFS  = str(PROJECT_ROOT / "runs/bcsd_coefs")
+OUTDIR = str(PROJECT_ROOT / "runs/exp/20260720-eda-bcsd-why")
 YEAR = 2020; STRIDE = 1; BOX = 384; FACTOR = 6   # STRIDE=1=全年(汇报口径); 调大只为快速探索
 VARS = ["2m_temperature_max", "2m_temperature_min", "total_precipitation_24hr"]
 LAB  = {"2m_temperature_max": "tmax (K)", "2m_temperature_min": "tmin (K)", "total_precipitation_24hr": "precip log1p(mm)"}

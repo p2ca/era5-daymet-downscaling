@@ -44,6 +44,7 @@ from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.evaluation import eval_all_methods as EAM
 from era5_daymet.training import train_corrdiff as CD
 from era5_daymet.training import train_downscale as TD
+from era5_daymet.paths import PROJECT_ROOT
 
 EXTENT = [-125.125, -65.125, 23.625, 53.625]         # 与学长 plot_compare.py 一致
 ASPECT = 1.0 / np.cos(np.deg2rad(0.5 * (EXTENT[2] + EXTENT[3])))   # 修正美国经纬比例(≈1.28), 替代 aspect=ASPECT
@@ -76,18 +77,19 @@ def build(args):
     a_u = torch.load(uck, map_location="cpu").get("args", {})
     in_vars = a_u.get("in_vars", TD.DEFAULT_IN)
     out_vars = a_u.get("out_vars", TD.TARGETS)
+    use_clim = a_u.get("use_clim", True)                 # 旧 ckpt 无此键=23通道; 新 ckpt 存实际值
     Cout = len(out_vars)
-    Cin = len(in_vars) + 3 + Cout
+    Cin = TD.cond_channels(in_vars, out_vars, use_clim)
 
     stats = TD.Stats(args.stats_dir, in_vars, out_vars)
     test = TD.DownscaleData(args.era5_dir, args.daymet_dir, [args.year],
-                            in_vars, out_vars, stats)
+                            in_vars, out_vars, stats, use_clim=use_clim)
 
     # --- bilinear / bcsd / unet / vit: 直接复用 eval_all_methods 的 predictors ---
     eam_args = SimpleNamespace(
-        test_year=args.year, out_vars=out_vars, in_vars=in_vars,
-        unet_dir=args.unet_dir, vit_dir=args.vit_dir, base_dir="runs/base",
-        scd_dir="runs/scd", bcsd_coef_dir=args.bcsd_coef_dir, ensemble=1)
+        test_year=args.year, out_vars=out_vars, in_vars=in_vars, use_clim=use_clim,
+        unet_dir=args.unet_dir, vit_dir=args.vit_dir, base_dir=str(PROJECT_ROOT / "runs/base"),
+        scd_dir=str(PROJECT_ROOT / "runs/scd"), bcsd_coef_dir=args.bcsd_coef_dir, ensemble=1)
     det_preds = EAM.build_predictors(["bilinear", "bcsd", "unet", "vit"],
                                      test, stats, eam_args, device)
 

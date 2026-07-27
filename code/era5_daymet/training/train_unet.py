@@ -33,7 +33,13 @@ def main():
     p = argparse.ArgumentParser(description="独立 UNet 降尺度训练 (DDP + 早停)",
                                 formatter_class=argparse.RawTextHelpFormatter)
     TD.add_common_args(p)                                  # 通用: 数据/年份/patch/lr/epochs/patience...
-    p.add_argument("--base", type=int, default=64, help="UNet 通道基数(32/64/96)")
+    p.add_argument("--base", type=int, default=64, help="UNet 通道基数(指南 U1/U2/U3 = 64/128/192)")
+    # 整幅训练(与 train_vit.py 同名参数一致): UNet 全卷积, 感受野 ~54px << crop 192, 故整幅与裁块
+    # 学到的函数几乎相同; 用整幅是为了和整幅 ViT 对比时消除"空间采样方式"这个混杂变量。
+    p.add_argument("--full-frame", action="store_true",
+                   help="整幅 720x1440 训练+整幅评测(不切窗); 用 FullFrameDS, eval_tile=0")
+    p.add_argument("--epoch-frames", type=int, default=0,
+                   help="整幅: 每 epoch 见多少帧; >0 时有效 steps=ceil(N/(world*batch)), 加节点真省墙钟")
     p.add_argument("--smoke", action="store_true", help="合成数据秒级自测")
     args = p.parse_args()
 
@@ -44,16 +50,19 @@ def main():
 
     if args.smoke:
         TD.apply_smoke(args)                               # 覆写 dirs/years 为合成小数据
-    TD.check_patch(args)                                   # --patch 必须能被 FACTOR=6 整除
+    if not args.full_frame:                                # 整幅不切窗, 无 crop 整除约束(720/1440 天然合法)
+        TD.check_patch(args)                               # --patch 必须能被 FACTOR=6 整除
 
     rank, world, local, device, is_dist = TD.setup_ddp()
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
-    Cin = len(args.in_vars) + 3 + len(args.out_vars)       # bilinear(ERA5)+Δz+landcover+lsm+climatology
+    Cin = TD.cond_channels(args.in_vars, args.out_vars, args.use_clim)  # bilinear(ERA5)+Δz+lc+lsm(+气候态 if --use-clim)
     Cout = len(args.out_vars)
     model = TD.UNet(Cin, Cout, base=args.base, temb=0).to(device)
     n_par = sum(x.numel() for x in model.parameters())
     if rank == 0:
-        print(f"[UNet] base={args.base}  Cin={Cin} Cout={Cout}  params={n_par/1e6:.1f}M  "
+        mode = f"full-frame(epoch_frames={args.epoch_frames})" if args.full_frame else f"crop{args.patch}"
+        print(f"[UNet] {mode}  amp={'bf16' if args.amp else 'fp32'}  "
+              f"base={args.base}  Cin={Cin} Cout={Cout}  params={n_par/1e6:.1f}M  "
               f"world={world}  train={args.train_years[0]}-{args.train_years[-1]}  "
               f"val={args.val_years}  test={args.test_year}  patience={args.patience}", flush=True)
 

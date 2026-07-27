@@ -186,11 +186,15 @@ def main():
     p = argparse.ArgumentParser(description="独立 ViT 降尺度训练 (DDP + 早停)",
                                 formatter_class=argparse.RawTextHelpFormatter)
     TD.add_common_args(p)
-    p.add_argument("--vit-patch", type=int, default=2, help="patch 边长(默认 2)")
-    p.add_argument("--dim", type=int, default=384, help="embedding 维度")
-    p.add_argument("--depth", type=int, default=8, help="Transformer block 数")
-    p.add_argument("--heads", type=int, default=6, help="注意力头数")
-    p.add_argument("--mlp", type=float, default=4.0, help="MLP 扩张倍数")
+    # 默认对齐指南 V3_LARGE 的参数预算(~15.2M), 做与 U-Net U3_BASE192(14.2M)公平的同参数量对比。
+    # V3 名义超参 = patch2/dim384/depth6/heads12/mlp4(=>15.182M in 指南实现)。但本实现的上采样头更轻
+    # (PixelShuffle+卷积细化头仅~1M, 见 docs/reference/instruction.html 无此层规定), depth=6 只有 11.6M;
+    # 故 depth 取 8 补回头部差额 -> 15.19M ≈ 指南 V3。其余(dim/heads/patch/mlp)严格取 V3 值。
+    p.add_argument("--vit-patch", type=int, default=2, help="patch 边长(V3=2)")
+    p.add_argument("--dim", type=int, default=384, help="embedding 维度(V3=384)")
+    p.add_argument("--depth", type=int, default=8, help="Transformer block 数(V3名义=6; 取8对齐V3参数预算~15.2M)")
+    p.add_argument("--heads", type=int, default=12, help="注意力头数(V3=12)")
+    p.add_argument("--mlp", type=float, default=4.0, help="MLP 扩张倍数(V3=4)")
     p.add_argument("--dropout", type=float, default=0.0, help="注意力/MLP/pos dropout(抗过拟合; 默认 0=旧口径)")
     p.add_argument("--drop-path", type=float, default=0.0, help="stochastic depth, 沿深度线性 0->此值")
     p.add_argument("--pos-type", choices=["sincos", "learned"], default="sincos",
@@ -206,10 +210,11 @@ def main():
     p.add_argument("--sp-size", type=int, default=8,
                    help="SP 组大小(节点内 GCD 数, 建议=每节点GCD数=8); world 须被其整除")
     p.add_argument("--smoke", action="store_true", help="合成数据秒级自测")
-    # ViT 专属默认: crop 小一点(token 数可控) + warmup + 梯度裁剪(Transformer 需要)
+    # ViT 专属默认: crop 小一点(token 数可控) + 梯度裁剪(Transformer 需要)
     # patch=60 而非 64: 必须被 FACTOR=6 整除(见 TD.check_patch), 64 会在真数据上崩
     # lr=1e-4 + grad_clip=1.0: 3e-4 无裁剪时发散(runs/exp/20260712-vit-d384, val 随 lr 单调变差)
-    p.set_defaults(patch=60, batch=8, warmup=5, lr=1e-4, grad_clip=1.0)
+    # LR 策略: 无 warmup, plateau 减半(见 TD.fit_deterministic; --lr-patience/--lr-factor/--min-lr)
+    p.set_defaults(patch=60, batch=8, lr=1e-4, grad_clip=1.0)
     args = p.parse_args()
 
     if TD.torch is None:
@@ -246,7 +251,7 @@ def main():
             print(f"[SP] 序列并行: sp_size={sp_size} dp_size={dp_size} (world={world}); "
                   f"单步~1/{sp_size}, 全局 batch={dp_size*args.batch}", flush=True)
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
-    Cin = len(args.in_vars) + 3 + len(args.out_vars)
+    Cin = TD.cond_channels(args.in_vars, args.out_vars, args.use_clim)   # 默认20通道; --use-clim=23
     Cout = len(args.out_vars)
     model = ViT(Cin, Cout, img=args.patch, patch=args.vit_patch,
                 dim=args.dim, depth=args.depth, heads=args.heads, mlp=args.mlp,
@@ -262,7 +267,7 @@ def main():
         print(f"[ViT] patch={args.vit_patch} dim={args.dim} depth={args.depth} heads={args.heads} "
               f"pos={args.pos_type} head_up={args.head_up} {toks}  params={n_par/1e6:.1f}M  "
               f"world={world}  train={args.train_years[0]}-{args.train_years[-1]} test={args.test_year} "
-              f"patience={args.patience} warmup={args.warmup}", flush=True)
+              f"patience={args.patience} lr={args.lr:.1e} lr_patience={args.lr_patience} lr_factor={args.lr_factor}", flush=True)
 
     TD.fit_deterministic(model, stats, args, device, (rank, world, local, is_dist), sp_ctx=sp_ctx)
     if sp_ctx is not None:

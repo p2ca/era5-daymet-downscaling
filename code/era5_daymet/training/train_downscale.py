@@ -41,6 +41,7 @@ from era5_daymet.data.downscale_baseline import (
     npz_memmap,
 )
 from era5_daymet.data.compute_norm_stats import slot_index
+from era5_daymet.paths import PROJECT_ROOT
 
 try:
     import torch
@@ -82,9 +83,10 @@ def precip_inv(x, scale, max_log=PRECIP_LOG_MAX, return_clipped=False):
     p = np.maximum(np.expm1(np.minimum(x, max_log)), 0.0) / scale
     return (p, n_clip) if return_clipped else p
 
-# ★输入合同(2026-07-17, 对齐学长规范): 17 ERA5 动态变量, 严格按此顺序。
-#   加 3 静态(dz/lc/lsm) + 3 气候态(逐日, ★保留★) => 条件通道 = 17+3+3 = 23。
-#   注: 学长规范删气候态(20 通道), 我们按用户决定保留气候态 -> 23 通道。
+# ★输入合同(对齐 docs/reference/instruction.html): 17 ERA5 动态变量, ★必须严格按此顺序读取★。
+#   加 3 静态(dz/lc/lsm) => 条件通道 = 17+3 = 20(指南口径, 默认)。
+#   气候态默认删除(指南要求"3 climatology 通道从所有实验中删除")。
+#   --use-clim 可选保留 3 个逐日气候态通道 -> 23 通道(旧口径, 仅用于复现早期 23 通道实验)。
 DEFAULT_IN = ["2m_temperature", "2m_temperature_max", "2m_temperature_min",
               "total_precipitation_24hr", "10m_u_component_of_wind", "10m_v_component_of_wind",
               "volumetric_soil_water_layer_1", "geopotential_500", "geopotential_850",
@@ -92,6 +94,13 @@ DEFAULT_IN = ["2m_temperature", "2m_temperature_max", "2m_temperature_min",
               "u_component_of_wind_500", "u_component_of_wind_850",
               "v_component_of_wind_500", "v_component_of_wind_850"]
 PRECIP = "total_precipitation_24hr"
+
+
+def cond_channels(in_vars, out_vars, use_clim):
+    """条件输入通道数: len(ERA5 动态) + 3 静态(dz/lc/lsm) + (气候态 = len(out_vars) if use_clim)。
+    默认 use_clim=False -> 20 通道(指南口径); use_clim=True -> 23(旧口径)。
+    训练/评测/构模所有地方都用它, 保证与 DownscaleData.get_patch 拼出的 cond 通道数一致。"""
+    return len(in_vars) + 3 + (len(out_vars) if use_clim else 0)
 
 
 # ===========================================================================
@@ -123,8 +132,9 @@ class Stats:
 # 2. 数据(numpy, 不依赖 torch)
 # ===========================================================================
 class DownscaleData:
-    def __init__(self, era5_dir, daymet_dir, years, in_vars, out_vars, stats, factor=FACTOR):
+    def __init__(self, era5_dir, daymet_dir, years, in_vars, out_vars, stats, factor=FACTOR, use_clim=False):
         self.in_vars, self.out_vars, self.s, self.f = in_vars, out_vars, stats, factor
+        self.use_clim = use_clim                          # 是否把 3 个逐日气候态拼进 cond(默认关=20通道)
         self.lr, self.hr, self.dz, self.lc, self.lsm, self.mask, self.slots, self.ndays = ({} for _ in range(8))
         upref = None
         for y in years:
@@ -168,11 +178,14 @@ class DownscaleData:
         dz = (self.dz[y][y0:y0 + Ph, x0:x0 + Pw] / s.oro_std)[None]
         lc = ((self.lc[y][y0:y0 + Ph, x0:x0 + Pw] - s.lc_mean) / s.lc_std)[None]
         lsm = self.lsm[y][y0:y0 + Ph, x0:x0 + Pw][None]
-        slot = int(self.slots[y][t])
-        # 气候态作为条件通道(已与 stats 同变换/单位, 直接按 daymet mean/std 归一化)
-        climc = np.stack([(s.clim[v][slot, y0:y0 + Ph, x0:x0 + Pw] - s.d_mean[i]) / s.d_std[i]
-                          for i, v in enumerate(self.out_vars)], 0)                    # (Cout,Ph,Pw)
-        cond = np.concatenate([cin, dz, lc, lsm, climc], 0).astype(np.float32)         # (Cin+3+Cout,Ph,Pw)
+        parts = [cin, dz, lc, lsm]
+        if self.use_clim:                                 # 可选: 3 个逐日气候态条件通道(默认关, 指南=20通道)
+            slot = int(self.slots[y][t])
+            # 气候态(已与 stats 同变换/单位, 直接按 daymet mean/std 归一化)
+            climc = np.stack([(s.clim[v][slot, y0:y0 + Ph, x0:x0 + Pw] - s.d_mean[i]) / s.d_std[i]
+                              for i, v in enumerate(self.out_vars)], 0)                # (Cout,Ph,Pw)
+            parts.append(climc)
+        cond = np.concatenate(parts, 0).astype(np.float32)   # (Cin,Ph,Pw); Cin=len(in)+3(+Cout if use_clim)
         hr = np.stack([self._hr(y, v, t)[y0:y0 + Ph, x0:x0 + Pw] for v in self.out_vars], 0).astype(np.float32)
         ht = hr.copy()
         for i, v in enumerate(self.out_vars):
@@ -200,25 +213,89 @@ class DownscaleData:
 # 3. torch: Dataset / UNet / Diffusion / 指标
 # ===========================================================================
 if torch is not None:
+    # --- DataLoader worker 播种 -----------------------------------------------
+    # 修复: PatchDS/FullFrameDS 把 np.random RNG 存在 Dataset 对象里, 且 __getitem__
+    # 不使用索引 i。num_workers>0 时 DataLoader fork 出的每个 worker 会复制同一 RNG
+    # 状态, 从而产生完全重复的采样序列; 非持久 worker 每个 epoch 重新 fork, 序列还会
+    # 逐 epoch 从相同状态重来。full-frame 每 epoch 名义帧数本就少, 该重复尤其严重。
+    # 训练集: 由 ds_worker_init 给每个 (DDP rank, worker, epoch) 重播种成唯一 RNG。
+    # 验证集: 用 deterministic=True, 采样只依赖"全局索引 index_offset+i", 因而逐 epoch 完全
+    #         固定(LR 减半/早停判据无采样噪声, 见 docs/investigations/vit-global-failure.md),
+    #         同时由调用方按 dp_rank 给出不重叠的 index_offset -> 各 rank 评不同帧。
+    #   ★2026-07-25 修: 原实现 index_offset 恒为 0, 所有 rank 评的是同一批 val_steps 帧
+    #     (128 卡重复算 128 遍, 冗余 99%), 且整个训练只看过 8 天(缺 6/7/8/10/12 月)。
+    #     分片后墙钟不变, 覆盖的验证日期 x dp_size。
+    def ds_worker_init(worker_id):
+        info = torch.utils.data.get_worker_info()
+        if info is None:
+            return
+        ds = info.dataset
+        if getattr(ds, "deterministic", False) or getattr(ds, "stream", False):
+            return                                  # 确定性/洗牌流采样都只用全局索引, 不依赖 self.rng
+        base = int(getattr(ds, "base_seed", 0))
+        # info.seed 由 torch 按 (DataLoader 迭代器=每 epoch 的 base_seed) + worker_id 生成,
+        # 故对 (worker, epoch) 唯一; 再拼 base(含 DDP rank) 保证跨 rank 也唯一。
+        ds.rng = np.random.default_rng(np.random.SeedSequence([base, int(info.seed)]))
+
     class PatchDS(torch.utils.data.Dataset):
-        def __init__(self, data, P, length, seed=0):
+        def __init__(self, data, P, length, seed=0, deterministic=False, index_offset=0):
             self.d, self.P, self.len = data, P, length
-            self.rng = np.random.default_rng(seed)
+            self.base_seed = int(seed)
+            self.deterministic = deterministic
+            self.index_offset = int(index_offset)   # 确定性(val)分片起点; 训练路径不用
+            self.rng = np.random.default_rng(seed)  # 训练路径用; worker 会按 rank/worker/epoch 重播种
         def __len__(self): return self.len
         def __getitem__(self, i):
-            cond, tgt, m, _ = self.d.random_patch(self.rng, self.P)
+            rng = (np.random.default_rng(np.random.SeedSequence([self.base_seed, self.index_offset + int(i)]))
+                   if self.deterministic else self.rng)
+            cond, tgt, m, _ = self.d.random_patch(rng, self.P)
             return torch.from_numpy(cond), torch.from_numpy(tgt), torch.from_numpy(m)
 
     class FullFrameDS(torch.utils.data.Dataset):
-        """整幅(720x1440)训练用: 每个样本 = 随机一帧完整场(不切窗)。接口同 PatchDS。
-        唯一帧数 = Σ_year ndays(~13,870), 故随机有放回采样(length 由训练循环按 epoch 步数定)。"""
-        def __init__(self, data, length, seed=0):
+        """整幅(720x1440)训练/验证用: 每个样本 = 一帧完整场(不切窗)。接口同 PatchDS。
+        唯一帧数 = Σ_year ndays(~13,870)。三种取帧模式, 都只由"全局索引"决定, 不依赖可变状态:
+
+        stream=True(训练, 标准做法): 洗牌后顺序遍历的连续流 —— 每遍数据(N 帧)用一个只依赖
+            (base_seed, 第几遍) 的置换, 全局序号 g = epoch*epoch_span + index_offset + i,
+            取 perm[g % N]。等价于 DeiT 的 DistributedSampler(shuffle=True)+set_epoch 与
+            EDM 的 InfiniteSampler: **无放回**、跨 rank 分片必不相同、每帧曝光次数几乎相等
+            (总样本 153,600 / N=13,870 -> 每帧恰好 11 或 12 次)。
+            ★改前用的是 self.rng 有放回随机抽, 每帧曝光 11.07±3.35, 3.7% 的帧全程只被看 ≤5 次。
+        deterministic=True(验证): 固定置换 + 固定全局索引 -> 逐 epoch 完全不变(判据无采样噪声),
+            不同 index_offset 的 rank 落在互不重复的帧上。
+        两者皆否(兜底): 原来的有放回随机抽。"""
+        def __init__(self, data, length, seed=0, deterministic=False, index_offset=0,
+                     stream=False, epoch_span=0):
             self.d, self.len = data, length
+            self.base_seed = int(seed)
+            self.deterministic = deterministic
+            self.stream = stream
+            self.index_offset = int(index_offset)
+            self.epoch_span = int(epoch_span)       # 一个 epoch 内全体 rank 消耗的样本数
+            self.epoch = 0                          # 训练循环每轮设置(等价 sampler.set_epoch)
             self.rng = np.random.default_rng(seed)
             self.frames = [(y, t) for y in data.years for t in range(data.ndays[y])]  # (year,day) 平表
+            # 验证用固定置换: 只依赖 base_seed, 所有 rank 一致 -> 全局索引唯一决定帧, 分片互不重叠
+            self.perm = (np.random.default_rng(self.base_seed).permutation(len(self.frames))
+                         if deterministic else None)
+            self._pass_id, self._pass_perm = -1, None   # 训练流: 按"第几遍数据"缓存置换
         def __len__(self): return self.len
+        def _perm_for_pass(self, k):
+            """第 k 遍数据的置换。只依赖 (base_seed, k) -> 全 rank/全 worker 一致, 无状态。"""
+            if self._pass_id != k:
+                self._pass_id = k
+                self._pass_perm = np.random.default_rng(
+                    np.random.SeedSequence([self.base_seed, int(k)])).permutation(len(self.frames))
+            return self._pass_perm
         def __getitem__(self, i):
-            y, t = self.frames[int(self.rng.integers(len(self.frames)))]
+            n = len(self.frames)
+            if self.deterministic:
+                y, t = self.frames[int(self.perm[(self.index_offset + int(i)) % len(self.perm)])]
+            elif self.stream:
+                g = self.epoch * self.epoch_span + self.index_offset + int(i)   # 全局样本序号
+                y, t = self.frames[int(self._perm_for_pass(g // n)[g % n])]
+            else:
+                y, t = self.frames[int(self.rng.integers(n))]
             cond, tgt, m, _ = self.d.full(y, t)
             return torch.from_numpy(cond), torch.from_numpy(tgt), torch.from_numpy(m)
 
@@ -325,6 +402,119 @@ def pick_land_box(mask, sz):
     return (int(ys.min()), int(xs.min()), sz)
 
 
+def save_loss_history(out, history, plot=False):
+    """把逐 epoch 的 train/val loss 存成 loss_history.json(一等产物, 不再靠解析 stdout 日志);
+    plot=True 时另存 loss_curve.png(train 与 val 同图)。只应由 rank0 调用。
+    每 epoch 覆写 JSON 以防作业被杀时丢历史; PNG 通常只在训练末尾画一次。
+    matplotlib 缺失/绘图失败不影响训练: 只跳过 PNG, JSON 照存。"""
+    path = os.path.join(out, "loss_history.json")
+    json.dump(history, open(path, "w"), indent=2)
+    if not plot:
+        return path
+    try:
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        eps = [h["epoch"] for h in history]
+        tr = [h.get("train") for h in history]
+        va = [h.get("val") for h in history]
+        fig, ax = plt.subplots(figsize=(7, 4))
+        if any(v is not None for v in tr):
+            ax.plot(eps, tr, "-o", ms=3, label="train")
+        if any(v is not None for v in va):
+            ax.plot(eps, va, "-o", ms=3, label="val")
+        ax.set_xlabel("epoch"); ax.set_ylabel("masked MSE (normalized)")
+        ax.legend(); ax.grid(alpha=0.3)
+        fig.savefig(os.path.join(out, "loss_curve.png"), dpi=130, bbox_inches="tight")
+        plt.close(fig)
+    except Exception as e:
+        print(f"  [loss_history] 绘图跳过({type(e).__name__}: {e}); JSON 已存 {path}", flush=True)
+    return path
+
+
+_DETERMINISTIC_STATE_VERSION = 1
+
+
+def _atomic_torch_save(payload, path):
+    """Write a torch checkpoint without ever exposing a partially-written target.
+
+    Frontier can terminate a job at the wall-clock boundary while rank 0 is
+    serializing AdamW state.  Saving beside the target and replacing it only
+    after a successful write keeps the previous completed-epoch checkpoint
+    usable in that case.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _contract_value(value):
+    """Convert argparse values to stable, JSON-like objects for comparison."""
+    if isinstance(value, (list, tuple)):
+        return [_contract_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _contract_value(v) for k, v in sorted(value.items())}
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _deterministic_resume_contract(args, dp_size, steps, tr_span):
+    """Training/data fields that must not silently change across a resume.
+
+    ``epochs`` is deliberately absent: on resume it means the new *total*
+    target epoch.  Output/log/evaluation-only settings and worker count are
+    also allowed to change.  Everything affecting the model, optimizer,
+    sampler stream, validation decisions, or data contract is pinned.
+    """
+    fields = (
+        "model", "era5_dir", "daymet_dir", "stats_dir",
+        "in_vars", "out_vars", "use_clim", "train_years", "val_years",
+        "full_frame", "epoch_frames", "steps_per_epoch", "batch",
+        "lr", "weight_decay", "lr_patience", "lr_factor", "min_lr",
+        "patience", "grad_clip", "amp", "val_steps",
+        "vit_patch", "dim", "depth", "heads", "mlp", "dropout",
+        "drop_path", "pos_type", "head_up", "seq_parallel", "sp_size",
+        "base",
+    )
+    values = {}
+    for name in fields:
+        if not hasattr(args, name):
+            continue
+        value = getattr(args, name)
+        if name in {"era5_dir", "daymet_dir", "stats_dir"}:
+            value = os.path.abspath(value)
+        values[name] = _contract_value(value)
+    return {
+        "state_version": _DETERMINISTIC_STATE_VERSION,
+        "sampler": "fullframe_stream_no_replacement_v1"
+                   if getattr(args, "full_frame", False) else "patch_worker_rng_v1",
+        "dp_size": int(dp_size),
+        "steps_per_epoch_effective": int(steps),
+        "train_span_per_epoch": int(tr_span),
+        "values": values,
+    }
+
+
+def _resume_contract_mismatches(saved, current):
+    """Return human-readable resume contract differences."""
+    if not isinstance(saved, dict):
+        return ["checkpoint 没有有效的 resume_contract"]
+    diffs = []
+    for key in ("state_version", "sampler", "dp_size",
+                "steps_per_epoch_effective", "train_span_per_epoch"):
+        if saved.get(key) != current.get(key):
+            diffs.append(f"{key}: checkpoint={saved.get(key)!r}, current={current.get(key)!r}")
+    old_values = saved.get("values", {})
+    new_values = current.get("values", {})
+    for key in sorted(set(old_values) | set(new_values)):
+        if old_values.get(key) != new_values.get(key):
+            diffs.append(f"{key}: checkpoint={old_values.get(key)!r}, current={new_values.get(key)!r}")
+    return diffs
+
+
 # ===========================================================================
 # 4. DDP
 # ===========================================================================
@@ -368,19 +558,20 @@ def run(args):
 
     stats = Stats(args.stats_dir, args.in_vars, args.out_vars)
     Cout = len(args.out_vars)
-    Cin = len(args.in_vars) + 3 + Cout            # ERA5输入 + [Δz,landcover,lsm] + 气候态条件
+    Cin = cond_channels(args.in_vars, args.out_vars, args.use_clim)   # ERA5 + [Δz,lc,lsm](+气候态 if --use-clim)
     in_ch = Cin + (Cout if args.model == "diffusion" else 0)
     temb = 128 if args.model == "diffusion" else 0
     model = UNet(in_ch, Cout, base=args.base, temb=temb).to(device)
     diff = Diffusion(args.diff_steps, device) if args.model == "diffusion" else None
 
     if not args.eval_only:
-        data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats)
+        data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
         ds = PatchDS(data, args.patch, args.steps_per_epoch * args.batch, seed=1234 + rank)
         dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, num_workers=args.workers,
-                                         drop_last=True, pin_memory=True)
+                                         drop_last=True, pin_memory=True, worker_init_fn=ds_worker_init)
         ddp = DDP(model, device_ids=[local], static_graph=True) if is_dist else model
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        history = []                                   # 逐 epoch train loss -> loss_history.json
         for ep in range(args.epochs):
             ddp.train(); t0 = time.time(); tot = 0.0; nb = 0
             for cond, tgt, m in dl:
@@ -391,8 +582,13 @@ def run(args):
             if is_dist:
                 lt = torch.tensor([tot, nb], device=device); dist.all_reduce(lt); tot, nb = lt[0].item(), lt[1].item()
             if is_main:
-                print(f"  epoch {ep+1}/{args.epochs} loss={tot/max(nb,1):.4f} {time.time()-t0:.0f}s", flush=True)
+                trloss = tot / max(nb, 1)
+                print(f"  epoch {ep+1}/{args.epochs} loss={trloss:.4f} {time.time()-t0:.0f}s", flush=True)
+                history.append({"epoch": ep + 1, "train": trloss})   # 此路径无 val(cnn/diffusion 盲跑固定轮数)
+                save_loss_history(args.out, history)
         if is_main:
+            if history:
+                save_loss_history(args.out, history, plot=True)
             torch.save({"model": model.state_dict(), "args": vars(args)}, os.path.join(args.out, "ckpt.pt"))
             print("  -> ckpt.pt", flush=True)
         if is_dist:
@@ -414,7 +610,7 @@ def evaluate(model, diff, stats, args, device, is_main=True):
     """is_main=False(仅序列并行整幅评测时): 本 rank 只参与每天的前向集合通信(det_predict 里
     模型 all-gather K/V), 不累计指标/不写文件 -> 让整幅评测也 ~1/sp 快, 而非 rank0 单卡 136s/帧。"""
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-    test = DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year], args.in_vars, args.out_vars, stats)
+    test = DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year], args.in_vars, args.out_vars, stats, use_clim=getattr(args, "use_clim", False))
     model.eval(); Cout = len(args.out_vars); y = args.test_year
     days = list(range(0, test.ndays[y], args.eval_stride))
     agg = {v: dict(se=0., ae=0., be=0., n=0., sp=0., st=0., spp=0., stt=0., spt=0., crps=0., nd=0) for v in args.out_vars}
@@ -488,10 +684,12 @@ def add_common_args(p):
     p.add_argument("--stats-dir", default="stats_train")
     p.add_argument("--in-vars", nargs="+", default=DEFAULT_IN)
     p.add_argument("--out-vars", nargs="+", default=TARGETS)
+    p.add_argument("--use-clim", action="store_true",
+                   help="保留 3 个逐日气候态条件通道 -> 23 通道(旧口径); 默认关=20 通道(指南口径)")
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["train"])   # 1980-2017
     p.add_argument("--val-years", type=int, nargs="+", default=M.splits["val"])       # 2018-2019(早停监控)
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])              # 2020(最终评测)
-    p.add_argument("--out", default="runs/exp")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "runs/exp"))
     p.add_argument("--patch", type=int, default=128)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -500,10 +698,17 @@ def add_common_args(p):
     p.add_argument("--steps-per-epoch", type=int, default=500)
     p.add_argument("--val-steps", type=int, default=50)
     p.add_argument("--patience", type=int, default=10, help="val 连续 N 个 epoch 不提升就早停")
-    p.add_argument("--warmup", type=int, default=0, help="LR 线性 warmup 的 epoch 数(ViT 建议 5-10)")
+    p.add_argument("--warmup", type=int, default=0,
+                   help="[已弃用] plateau 减半策略不使用 warmup; 保留仅为兼容旧命令, 不生效")
+    p.add_argument("--lr-patience", type=int, default=2,
+                   help="val 连续 N 个 epoch 不提升就把 LR ×lr-factor(激进默认=2); 应 < --patience")
+    p.add_argument("--lr-factor", type=float, default=0.5, help="LR plateau 衰减因子(减半=0.5)")
+    p.add_argument("--min-lr", type=float, default=1e-6, help="LR 减半下限, 到此不再减")
     p.add_argument("--grad-clip", type=float, default=0.0,
                    help="梯度裁剪 max-norm; 0=关闭(UNet baseline 口径)。Transformer 建议 1.0")
     p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--resume-from", default="",
+                   help="从同一 --out 目录内的完整 last.pt 接续；--epochs 是续训后的累计目标 epoch")
     p.add_argument("--amp", action="store_true",
                    help="开启 bf16 autocast 混合精度(MI250X 上 1.5-2x 提速; bf16 range 够大, 无需 GradScaler)")
     p.add_argument("--eval-stride", type=int, default=1)
@@ -527,7 +732,7 @@ def check_patch(args):
 
 
 def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
-    """train(train_years) + 早停(val_years, masked MSE) + warmup/余弦 LR; 存 best, 评测时载入。
+    """train(train_years) + 早停(val_years, masked MSE) + plateau 减半 LR(无 warmup); 存 best, 评测时载入。
     sp_ctx!=None: 序列并行(整幅)——SP 组内多 GCD 协同算一帧, 不走 DDP, 手动分类梯度同步。"""
     rank, world, local, is_dist = ddp_info
     is_main = (rank == 0)
@@ -537,8 +742,8 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
     seed_off = sp_ctx["dp_rank"] if sp else rank
     if is_main:
         os.makedirs(args.out, exist_ok=True)
-    tr_data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats)
-    va_data = DownscaleData(args.era5_dir, args.daymet_dir, args.val_years, args.in_vars, args.out_vars, stats)
+    tr_data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
+    va_data = DownscaleData(args.era5_dir, args.daymet_dir, args.val_years, args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
     full_frame = getattr(args, "full_frame", False)
     # DDP steps 修复(4.4): 固定"每 epoch 见 epoch_frames 帧", steps 随数据并行度收缩 -> 加节点真省墙钟。
     # (SP 用 dp_size 而非 world: SP 组内是同一帧的 token 切分, 不增加帧吞吐。)
@@ -549,16 +754,42 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
             sp_note = f" | 序列并行 sp_size={dist.get_world_size(sp_ctx['sp_group'])} 单步~1/sp" if sp else ""
             print(f"[full-frame] epoch_frames={args.epoch_frames} dp_size={dp_size} batch/rank={args.batch} "
                   f"-> steps/epoch={steps}, 全局 batch={dp_size*args.batch}{sp_note}", flush=True)
+    # --- val 采样: 逐 epoch 固定 + 按 dp_rank 分片(见 FullFrameDS/ds_worker_init 处的说明) ---
+    # 每 rank 仍跑 val_steps 步(墙钟不变), 但整幅模式下把 val_steps 压到"不重复取帧"的上限,
+    # 使 dp_size x val_steps 个索引落在互不相同的日期上; 覆盖数 = min(dp_size*val_steps, 验证集帧数)。
+    val_steps = args.val_steps
+    val_pool = sum(va_data.ndays[y] for y in va_data.years)
     if full_frame:
-        tr_ds = FullFrameDS(tr_data, steps * args.batch, seed=1234 + seed_off)
-        va_ds = FullFrameDS(va_data, args.val_steps * args.batch, seed=987)
+        val_steps = max(1, min(val_steps, val_pool // max(1, dp_size * args.batch)))
+    val_len = val_steps * args.batch
+    if is_main:
+        cov = min(val_len * dp_size, val_pool) if full_frame else val_len * dp_size
+        note = f"(请求 {args.val_steps}, 受验证集 {val_pool} 帧上限约束)" if val_steps < args.val_steps else ""
+        kind = "帧" if full_frame else "patch"
+        print(f"[val] dp_size={dp_size} val_steps={val_steps}/rank{note} batch/rank={args.batch} "
+              f"-> 每 epoch 评 {cov} 个不同{kind}(验证集共 {val_pool} 帧), 逐 epoch 固定", flush=True)
+    if full_frame:
+        # 训练: 洗牌无放回的连续流(标准做法; 见 FullFrameDS 文档串)。种子不含 rank —— 置换必须
+        # 全 rank 一致, rank 的差异只体现在 index_offset 上, 才能保证分片互不重叠。
+        tr_span = dp_size * steps * args.batch
+        tr_ds = FullFrameDS(tr_data, steps * args.batch, seed=1234, stream=True,
+                            index_offset=seed_off * steps * args.batch, epoch_span=tr_span)
+        va_ds = FullFrameDS(va_data, val_len, seed=987, deterministic=True,
+                            index_offset=seed_off * val_len)
+        if is_main:
+            tr_pool = sum(tr_data.ndays[y] for y in tr_data.years)
+            tot = args.epochs * tr_span
+            print(f"[train] 洗牌无放回连续流(标准): 每 epoch {tr_span} 帧, 训练集共 {tr_pool} 帧 "
+                  f"-> {args.epochs} epoch 累计 {tot} 帧次 = 每帧 {tot // tr_pool}~{tot // tr_pool + 1} 次",
+                  flush=True)
     else:
         tr_ds = PatchDS(tr_data, args.patch, steps * args.batch, seed=1234 + seed_off)
-        va_ds = PatchDS(va_data, args.patch, args.val_steps * args.batch, seed=987)
+        va_ds = PatchDS(va_data, args.patch, val_len, seed=987, deterministic=True,
+                        index_offset=seed_off * val_len)
     tr = torch.utils.data.DataLoader(tr_ds, batch_size=args.batch, num_workers=args.workers,
-                                     drop_last=True, pin_memory=True)
+                                     drop_last=True, pin_memory=True, worker_init_fn=ds_worker_init)
     va = torch.utils.data.DataLoader(va_ds, batch_size=args.batch, num_workers=max(1, args.workers // 2),
-                                     drop_last=True)
+                                     drop_last=True, worker_init_fn=ds_worker_init)
     if sp:                                                 # 序列并行: 不走 DDP, 手动分类梯度同步
         net = model
         from era5_daymet.models import seq_parallel_attn as SP
@@ -574,17 +805,72 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
         net = DDP(model, device_ids=[local], static_graph=True) if is_dist else model
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    def lr_scale(ep):
-        if args.warmup and ep < args.warmup:
-            return (ep + 1) / args.warmup
-        prog = (ep - args.warmup) / max(1, args.epochs - args.warmup)
-        return 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
-
     use_amp = getattr(args, "amp", False)                 # bf16 autocast(--amp); 默认 fp32 口径不变
+    # LR 策略(激进, 无 warmup/余弦): 从 args.lr 起; val 连续 lr_patience 个 epoch 不提升 -> LR ×lr_factor
+    #   (默认减半), 直到 min_lr; 减半后重置 plateau 窗口。早停仍看 args.patience(应 > lr_patience)。
+    cur_lr = args.lr
+    plateau = 0
     best, bad, ckpt = float("inf"), 0, os.path.join(args.out, "ckpt.pt")
-    for ep in range(args.epochs):
+    last = os.path.join(args.out, "last.pt")               # 每个完整 epoch 的训练态；真正续训用
+    history = []                                           # 逐 epoch train/val loss -> loss_history.json
+    start_epoch = 0
+    tr_span = dp_size * steps * args.batch
+    resume_contract = _deterministic_resume_contract(args, dp_size, steps, tr_span)
+    resume_from = getattr(args, "resume_from", "")
+    if resume_from:
+        resume_from = os.path.abspath(resume_from)
+        if os.path.dirname(resume_from) != os.path.abspath(args.out):
+            raise RuntimeError("--resume-from 必须位于当前 --out 目录内，禁止把一个实验的状态写进另一个实验目录")
+        load_error = ""
+        state = None
+        try:
+            state = torch.load(resume_from, map_location=device)
+            if state.get("state_version") != _DETERMINISTIC_STATE_VERSION:
+                raise RuntimeError(
+                    f"不支持的 deterministic checkpoint 版本: {state.get('state_version')!r}")
+            mismatches = _resume_contract_mismatches(
+                state.get("resume_contract"), resume_contract)
+            if mismatches:
+                raise RuntimeError("续训配置与 checkpoint 不一致:\n  - " + "\n  - ".join(mismatches))
+            model.load_state_dict(state["model"])
+            opt.load_state_dict(state["opt"])
+        except Exception as e:
+            load_error = f"{type(e).__name__}: {e}"
+        if is_dist:
+            ok = torch.tensor([0 if load_error else 1], device=device, dtype=torch.int32)
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+            if not int(ok.item()):
+                if is_main and load_error:
+                    print(f"  [resume] 读取失败: {load_error}", flush=True)
+                raise RuntimeError("至少一个 DDP rank 无法读取或验证续训 checkpoint")
+        elif load_error:
+            raise RuntimeError(load_error)
+        start_epoch = int(state["epoch"]) + 1
+        best = float(state["best"])
+        bad = int(state["bad"])
+        plateau = int(state["plateau"])
+        cur_lr = float(state["cur_lr"])
+        if bad >= args.patience:
+            raise RuntimeError(
+                f"checkpoint 已经触发早停(bad={bad}, patience={args.patience})；"
+                "这不是墙钟截断，不能作为原样续训处理")
+        if args.epochs < start_epoch:
+            raise RuntimeError(
+                f"--epochs={args.epochs} 小于 checkpoint 的下一 epoch={start_epoch + 1}；"
+                "--epochs 表示累计目标，不是追加轮数")
+        if is_main:
+            history = list(state.get("history", []))
+            print(f"  ★续训: {resume_from} -> 从 epoch {start_epoch + 1} 接上；"
+                  f"目标累计 {args.epochs} epoch，best={best:.4f} bad={bad}/{args.patience} "
+                  f"next_lr={cur_lr:.2e}", flush=True)
+        if is_dist:
+            dist.barrier()
+
+    for ep in range(start_epoch, args.epochs):
+        tr_ds.epoch = ep                                  # 等价 DistributedSampler.set_epoch: 洗牌流推进到本轮
         for g in opt.param_groups:
-            g["lr"] = args.lr * lr_scale(ep)
+            g["lr"] = cur_lr                              # 本 epoch 的 LR(无 warmup/余弦)
+        lr_used = cur_lr
         net.train(); t0 = time.time(); trt = trn = 0.0
         for cond, tgt, m in tr:
             cond, tgt, m = cond.to(device), tgt.to(device), m.to(device)
@@ -608,19 +894,62 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
             vt, vn, trt, trn = tt[0].item(), tt[1].item(), tt[2].item(), tt[3].item()
         vloss = vt / max(vn, 1); trloss = trt / max(trn, 1)
         improved = vloss < best - 1e-4
+        halved = False
         if improved:
-            best, bad = vloss, 0
+            best, bad, plateau = vloss, 0, 0
         else:
-            bad += 1
+            bad += 1; plateau += 1
+            if plateau >= args.lr_patience and cur_lr > args.min_lr:
+                cur_lr = max(cur_lr * args.lr_factor, args.min_lr)   # ★val 卡住 -> LR 减半(下 epoch 生效)
+                plateau = 0; halved = True                          # 减半后重置 plateau 窗口(cooldown)
+        save_error = ""
         if is_main:
+            history.append({"epoch": ep + 1, "train": trloss, "val": vloss,
+                            "best": best, "lr": lr_used})
+            try:
+                save_loss_history(args.out, history)      # 每 epoch 覆写 JSON(防作业被杀丢历史)
+                if improved:
+                    _atomic_torch_save(
+                        {"model": model.state_dict(), "args": vars(args),
+                         "val_best": best, "epoch": ep}, ckpt)
+                # last.pt 必须在 early-stop 判断前写：无论正常到达上限还是墙钟终止，
+                # 它都代表最近一个完整 epoch，且保留 AdamW/LR/早停/采样推进所需状态。
+                _atomic_torch_save({
+                    "state_version": _DETERMINISTIC_STATE_VERSION,
+                    "model": model.state_dict(),
+                    "opt": opt.state_dict(),
+                    "epoch": ep,
+                    "best": best,
+                    "bad": bad,
+                    "plateau": plateau,
+                    "cur_lr": cur_lr,
+                    "history": history,
+                    "resume_contract": resume_contract,
+                    "args": vars(args),
+                    "saved_job_id": os.environ.get("SLURM_JOB_ID"),
+                    "stopped_early": bad >= args.patience,
+                }, last)
+            except Exception as e:
+                save_error = f"{type(e).__name__}: {e}"
+        if is_dist:
+            ok = torch.tensor([0 if save_error else 1], device=device, dtype=torch.int32)
+            dist.broadcast(ok, src=0)
+            if not int(ok.item()):
+                if is_main:
+                    print(f"  [checkpoint] 保存失败: {save_error}", flush=True)
+                raise RuntimeError("rank0 无法保存完整训练 checkpoint")
+        elif save_error:
+            raise RuntimeError(save_error)
+        if is_main:
+            hmsg = f" ↓LR->{cur_lr:.2e}" if halved else ""
             print(f"  ep {ep+1}/{args.epochs}  train={trloss:.4f}  val={vloss:.4f}  best={best:.4f}  bad={bad}/{args.patience}  "
-                  f"lr={args.lr*lr_scale(ep):.2e}  {time.time()-t0:.0f}s", flush=True)
-            if improved:
-                torch.save({"model": model.state_dict(), "args": vars(args), "val_best": best, "epoch": ep}, ckpt)
+                  f"lr={lr_used:.2e}{hmsg}  {time.time()-t0:.0f}s  [last.pt]", flush=True)
         if bad >= args.patience:                      # ★ 早停: 连续 patience 个 epoch 不提升
             if is_main:
                 print(f"  早停: val 连续 {args.patience} 个 epoch 没提升 (best={best:.4f})", flush=True)
             break
+    if is_main and history:
+        save_loss_history(args.out, history, plot=True)   # 训练末尾画 train/val 曲线
     if is_dist:
         dist.barrier()
     if is_main and os.path.exists(ckpt):
@@ -701,7 +1030,7 @@ def apply_smoke(args):
     args.in_vars = TARGETS; args.out_vars = TARGETS
     args.train_years = [2018]; args.val_years = [2019]; args.test_year = 2020
     args.patch = 48; args.batch = 4; args.epochs = 3; args.steps_per_epoch = 6; args.val_steps = 3
-    args.patience = 2; args.warmup = 1; args.workers = 0; args.eval_stride = 10; args.out = root + "/out"
+    args.patience = 2; args.lr_patience = 1; args.workers = 0; args.eval_stride = 10; args.out = root + "/out"
     return root
 
 
@@ -712,9 +1041,11 @@ def main():
     p.add_argument("--stats-dir", default="stats_train")
     p.add_argument("--in-vars", nargs="+", default=DEFAULT_IN)
     p.add_argument("--out-vars", nargs="+", default=TARGETS)
+    p.add_argument("--use-clim", action="store_true",
+                   help="保留 3 个逐日气候态条件通道 -> 23 通道(旧口径); 默认关=20 通道(指南口径)")
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["val"])
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])
-    p.add_argument("--out", default="runs/exp"); p.add_argument("--ckpt", default="runs/exp/ckpt.pt")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "runs/exp")); p.add_argument("--ckpt", default=str(PROJECT_ROOT / "runs/exp/ckpt.pt"))
     p.add_argument("--patch", type=int, default=192); p.add_argument("--base", type=int, default=64)
     p.add_argument("--batch", type=int, default=16); p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--epochs", type=int, default=40); p.add_argument("--steps-per-epoch", type=int, default=500)
