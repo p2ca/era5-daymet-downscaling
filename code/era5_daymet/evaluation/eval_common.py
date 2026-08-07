@@ -80,6 +80,9 @@ class MultiMethodEval:
         # 降水额外算一份 log 空间 SSIM: 物理空间里绝大多数格点是 0, 局部方差为 0 -> SSIM 虚高,
         # 分数被"共同的干区"主导而不是被降水结构主导。log1p 压缩后结构信息才看得见。
         self.ssim_log = {m: [0.0, 0] for m in methods}
+        # 降水的 RMSE/MAE/bias/corr 同样另算一份 log1p(mm) 空间的: 物理空间里量级由少数强降水
+        # 格点主导, 两个空间下方法的排名可以是相反的, 因此两份都要给出。
+        self.acc_log = {m: DB.Acc() for m in methods}
         self.msum = {m: np.zeros((self.Cout, H, W), np.float64) for m in methods}
         self.tsum = np.zeros((self.Cout, H, W), np.float64); self.nd = 0
         self.spec = {}                                            # 首日: spec['truth'][v], spec[m][v]={'mean','member'}
@@ -116,9 +119,10 @@ class MultiMethodEval:
                 if mem.shape[0] > 1:                              # spread(集合成员方差, ddof=1, 陆地均值)
                     dv = float(mem[:, i].var(axis=0, ddof=1)[mb].mean())
                     self.spread[m][v][0] += dv; self.spread[m][v][1] += 1
-            if pi is not None:                                    # 降水: 再算一份 log 空间 SSIM
+            if pi is not None:                                    # 降水: 再算一份 log 空间的 SSIM 与逐点指标
                 s = ssim_masked(lg(ens[pi]), lg(hr[pi]), mb, self.mb_er)
                 self.ssim_log[m][0] += s; self.ssim_log[m][1] += 1
+                self.acc_log[m].add(lg(ens[pi])[mb], lg(hr[pi])[mb])
             if mem.shape[0] > 1:
                 self.rh[m].append(TD.rank_hist(mem, hr, (mask[0] if mask.ndim == 3 else mask)))
             if m not in self.spec:                               # 首次见到该方法 -> 初始化功率谱累加器
@@ -129,7 +133,7 @@ class MultiMethodEval:
 
     # -------------------------------------------------------------------
     def finalize(self, out_dir, test_year, eval_stride=1, tag="all", n_total_days=None,
-                 make_plots=True):
+                 make_plots=True, make_maps=True):
         os.makedirs(out_dir, exist_ok=True)
         res = {}
         for m in self.methods:
@@ -150,9 +154,12 @@ class MultiMethodEval:
                 if v == PRECIP:
                     ls, ln = self.ssim_log[m]
                     r["ssim_log"] = round(ls / max(ln, 1), 4)
+                    for k, x in self.acc_log[m].result().items():
+                        r[f"{k}_log"] = x
                 res[m][v] = r
             res[m]["_ensemble"] = self.N[m]
-        res["_space"] = "physical (precip native units, no log); land-masked"
+        res["_space"] = ("physical (precip native units); precip additionally reported in "
+                         "log1p(mm) space with the _log suffix; land-masked")
         res["_note"] = "RMSE/MAE/bias/corr/SSIM on ensemble-mean; CRPS/rank-hist/spread on full ensemble (det CRPS==MAE)"
         res["_spread_skill_spec"] = (
             "spread = sqrt(mean over days of [land-mean of member variance, ddof=1]); "
@@ -221,7 +228,7 @@ class MultiMethodEval:
             print(bar + "\n")
 
         if make_plots:
-            self._plots(out_dir, test_year, tag)
+            self._plots(out_dir, test_year, tag, make_maps=make_maps)
         return res
 
     def dump_sums(self, path):
@@ -235,12 +242,13 @@ class MultiMethodEval:
               "crps": {m: {v: list(self.crps[m][v]) for v in self.ov} for m in self.methods},
               "ssim": {m: {v: list(self.ssim[m][v]) for v in self.ov} for m in self.methods},
               "spread": {m: {v: list(self.spread[m][v]) for v in self.ov} for m in self.methods},
-              "ssim_log": {m: list(self.ssim_log[m]) for m in self.methods}}
+              "ssim_log": {m: list(self.ssim_log[m]) for m in self.methods},
+              "acc_log": {m: vars(self.acc_log[m]).copy() for m in self.methods}}
         pickle.dump(st, open(path, "wb"))
         print(f"[shard] 累计量 -> {path} ({self.nd} 天, {list(self.methods)})", flush=True)
 
     # -------------------------------------------------------------------
-    def _plots(self, out_dir, test_year, tag):
+    def _plots(self, out_dir, test_year, tag, make_maps=True):
         try:
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         except Exception as e:
@@ -268,6 +276,8 @@ class MultiMethodEval:
         plt.close(fig)
 
         # (b) 年平均地图: 上排 truth+各方法均值场, 下排 各方法-truth 偏差
+        if not make_maps:
+            return
         tmean = self.tsum / max(self.nd, 1)
         mmean = {m: self.msum[m] / max(self.nd, 1) for m in self.methods}
         ext = [DB.LON_EDGES[0], DB.LON_EDGES[1], DB.LAT_EDGES[0], DB.LAT_EDGES[1]]
@@ -328,6 +338,7 @@ def merge_sums_and_finalize(sum_paths, out_dir, test_year, tag="corrdiff",
             ev.acc[m][v] = DB.Acc()
             ev.crps[m][v] = [0.0, 0]; ev.ssim[m][v] = [0.0, 0]; ev.spread[m][v] = [0.0, 0]
         ev.ssim_log[m] = [0.0, 0]
+        ev.acc_log[m] = DB.Acc()
     ACC_FIELDS = ("n", "se", "ae", "be", "sp", "st", "spp", "stt", "spt")
     for st in states:
         ev.nd += st["nd"]
@@ -340,6 +351,10 @@ def merge_sums_and_finalize(sum_paths, out_dir, test_year, tag="corrdiff",
                 for fld, key in ((ev.crps, "crps"), (ev.ssim, "ssim"), (ev.spread, "spread")):
                     fld[m][v][0] += st[key][m][v][0]; fld[m][v][1] += st[key][m][v][1]
             ev.ssim_log[m][0] += st["ssim_log"][m][0]; ev.ssim_log[m][1] += st["ssim_log"][m][1]
+            if "acc_log" in st:
+                al = ev.acc_log[m]
+                for k in ACC_FIELDS:
+                    setattr(al, k, getattr(al, k) + st["acc_log"][m][k])
     print(f"[merge] {len(states)} 个 shard -> 合计 {ev.nd} 天", flush=True)
     return ev.finalize(out_dir, test_year, eval_stride=1, tag=tag,
                        n_total_days=n_total_days, make_plots=False)

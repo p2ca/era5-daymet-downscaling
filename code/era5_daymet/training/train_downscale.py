@@ -46,7 +46,6 @@ from era5_daymet.paths import PROJECT_ROOT
 try:
     import torch
     import torch.nn as nn
-    import torch.nn.functional as F
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 except Exception:
@@ -294,73 +293,39 @@ if torch is not None:
             cond, tgt, m, _ = self.d.full(y, t)
             return torch.from_numpy(cond), torch.from_numpy(tgt), torch.from_numpy(m)
 
-    def sinusoidal_emb(t, dim):
-        half = dim // 2
-        f = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
-        a = t[:, None].float() * f[None]
-        return torch.cat([torch.sin(a), torch.cos(a)], -1)
+    # 网络主体与 DDPM 组件定义在 era5_daymet.models.unet; 此处重新导出, 使 `TD.UNet` 等
+    # 既有引用保持可用。torch 缺失时本模块的其余部分仍可导入(统计与基线路径不需要 torch)。
+    from era5_daymet.models.unet import (  # noqa: F401
+        DOMAIN_HW,
+        Diffusion,
+        ResBlock,
+        UNet,
+        masked_mse,
+        sincos_pos_grid,
+        sinusoidal_emb,
+    )
+    from era5_daymet.models.corrdiff_unet import CorrDiffUNet  # noqa: F401
 
-    class ResBlock(nn.Module):
-        def __init__(self, cin, cout, temb=0):
-            super().__init__()
-            self.n1 = nn.GroupNorm(8, cin); self.c1 = nn.Conv2d(cin, cout, 3, padding=1)
-            self.n2 = nn.GroupNorm(8, cout); self.c2 = nn.Conv2d(cout, cout, 3, padding=1)
-            self.emb = nn.Linear(temb, cout) if temb else None
-            self.skip = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
-        def forward(self, x, t=None):
-            h = self.c1(F.silu(self.n1(x)))
-            if self.emb is not None and t is not None:
-                h = h + self.emb(t)[:, :, None, None]
-            h = self.c2(F.silu(self.n2(h)))
-            return h + self.skip(x)
+    def build_regressor(cin, cout, cfg, temb=0):
+        """按结构参数构建确定性主体。
 
-    class UNet(nn.Module):
-        def __init__(self, in_ch, out_ch, base=64, temb=0):
-            super().__init__()
-            self.temb = temb
-            if temb:
-                self.tmlp = nn.Sequential(nn.Linear(temb, temb), nn.SiLU(), nn.Linear(temb, temb))
-            self.inc = nn.Conv2d(in_ch, base, 3, padding=1)
-            self.d1 = ResBlock(base, base, temb); self.p1 = nn.Conv2d(base, base, 4, 2, 1)
-            self.d2 = ResBlock(base, base * 2, temb); self.p2 = nn.Conv2d(base * 2, base * 2, 4, 2, 1)
-            self.mid = ResBlock(base * 2, base * 2, temb)
-            self.u2 = nn.ConvTranspose2d(base * 2, base * 2, 4, 2, 1); self.r2 = ResBlock(base * 4, base, temb)
-            self.u1 = nn.ConvTranspose2d(base, base, 4, 2, 1); self.r1 = ResBlock(base * 2, base, temb)
-            self.outc = nn.Sequential(nn.GroupNorm(8, base), nn.SiLU(), nn.Conv2d(base, out_ch, 3, padding=1))
-        def forward(self, x, t=None):
-            te = self.tmlp(sinusoidal_emb(t, self.temb)) if self.temb else None
-            x0 = self.d1(self.inc(x), te)
-            x1 = self.d2(self.p1(x0), te)
-            xm = self.mid(self.p2(x1), te)
-            h = self.r2(torch.cat([self.u2(xm), x1], 1), te)
-            h = self.r1(torch.cat([self.u1(h), x0], 1), te)
-            return self.outc(h)
-
-    def masked_mse(pred, tgt, mask):
-        d = (pred - tgt) ** 2 * mask
-        return d.sum() / (mask.sum() * pred.size(1) + 1e-6)
-
-    class Diffusion:
-        def __init__(self, T=1000, device="cpu"):
-            b = torch.linspace(1e-4, 0.02, T)
-            self.T = T; self.ac = torch.cumprod(1 - b, 0).to(device)
-        def loss(self, model, x0, cond, mask):
-            t = torch.randint(0, self.T, (x0.size(0),), device=x0.device)
-            noise = torch.randn_like(x0)
-            ac = self.ac[t][:, None, None, None]
-            xt = ac.sqrt() * x0 + (1 - ac).sqrt() * noise
-            pred = model(torch.cat([xt, cond], 1), t)
-            return masked_mse(pred, noise, mask)
-        @torch.no_grad()
-        def ddim(self, model, cond, shape, steps=50):
-            dev = cond.device; x = torch.randn(shape, device=dev)
-            ts = torch.linspace(self.T - 1, 0, steps).long().to(dev)
-            for i, t in enumerate(ts):
-                tb = torch.full((shape[0],), int(t), device=dev)
-                eps = model(torch.cat([x, cond], 1), tb); ac = self.ac[t]
-                x0 = (x - (1 - ac).sqrt() * eps) / ac.sqrt()
-                x = (self.ac[ts[i + 1]].sqrt() * x0 + (1 - self.ac[ts[i + 1]]).sqrt() * eps) if i < len(ts) - 1 else x0
-            return x
+        `cfg` 可以是 argparse Namespace, 也可以是 checkpoint 里存下的 args 字典 —— 训练、评测
+        和绘图共用本函数, 保证同一份 checkpoint 在任何入口都被还原成同一个结构。缺省值对应
+        本字段出现之前的行为, 因而旧 checkpoint 无需迁移即可还原。
+        """
+        get = cfg.get if isinstance(cfg, dict) else (lambda k, d=None: getattr(cfg, k, d))
+        arch = get("arch", "unet") or "unet"
+        pos_grid = int(get("pos_grid", 0) or 0)
+        if arch == "unet":
+            return UNet(cin, cout, base=int(get("base", 64)), temb=temb, pos_grid=pos_grid)
+        if arch == "corrdiff":
+            return CorrDiffUNet(cin, cout,
+                                model_channels=int(get("model_channels", 64)),
+                                channel_mult=tuple(get("channel_mult", (1, 2, 2, 2, 2))),
+                                num_blocks=int(get("num_blocks", 4)),
+                                attn_bottleneck=bool(int(get("attn_bottleneck", 1))),
+                                pos_grid=pos_grid, temb=temb)
+        raise ValueError(f"未知 arch: {arch!r} (可选: unet / corrdiff)")
 
 
 def crps_ensemble(members, truth, mask):
@@ -472,7 +437,8 @@ def _deterministic_resume_contract(args, dp_size, steps, tr_span):
         "patience", "grad_clip", "amp", "val_steps",
         "vit_patch", "dim", "depth", "heads", "mlp", "dropout",
         "drop_path", "pos_type", "head_up", "seq_parallel", "sp_size",
-        "base",
+        "base", "pos_grid",
+        "arch", "model_channels", "channel_mult", "num_blocks", "attn_bottleneck",
     )
     values = {}
     for name in fields:
@@ -493,6 +459,19 @@ def _deterministic_resume_contract(args, dp_size, steps, tr_span):
     }
 
 
+# 后加入 pinned 集合的字段, 及其"该字段存在之前的等效取值"。早于该字段的 checkpoint 契约里
+# 没有这个键, 只要当前取值与此处登记的等效值一致, 行为就与那份 checkpoint 相同, 可安全续训;
+# 取其他值则说明模型确实变了, 仍按不匹配处理。
+_LEGACY_CONTRACT_DEFAULTS = {
+    "pos_grid": 0,
+    "arch": "unet",
+    "model_channels": 64,
+    "channel_mult": [1, 2, 2, 2, 2],
+    "num_blocks": 4,
+    "attn_bottleneck": 1,
+}
+
+
 def _resume_contract_mismatches(saved, current):
     """Return human-readable resume contract differences."""
     if not isinstance(saved, dict):
@@ -505,6 +484,9 @@ def _resume_contract_mismatches(saved, current):
     old_values = saved.get("values", {})
     new_values = current.get("values", {})
     for key in sorted(set(old_values) | set(new_values)):
+        if key not in old_values and key in _LEGACY_CONTRACT_DEFAULTS:
+            if new_values.get(key) == _LEGACY_CONTRACT_DEFAULTS[key]:
+                continue
         if old_values.get(key) != new_values.get(key):
             diffs.append(f"{key}: checkpoint={old_values.get(key)!r}, current={new_values.get(key)!r}")
     return diffs
@@ -556,7 +538,8 @@ def run(args):
     Cin = cond_channels(args.in_vars, args.out_vars, args.use_clim)   # ERA5 + [Δz,lc,lsm](+气候态 if --use-clim)
     in_ch = Cin + (Cout if args.model == "diffusion" else 0)
     temb = 128 if args.model == "diffusion" else 0
-    model = UNet(in_ch, Cout, base=args.base, temb=temb).to(device)
+    model = UNet(in_ch, Cout, base=args.base, temb=temb,
+                 pos_grid=getattr(args, "pos_grid", 0)).to(device)
     diff = Diffusion(args.diff_steps, device) if args.model == "diffusion" else None
 
     if not args.eval_only:
@@ -701,12 +684,18 @@ def add_common_args(p):
     p.add_argument("--min-lr", type=float, default=1e-6, help="LR 减半下限, 到此不再减")
     p.add_argument("--grad-clip", type=float, default=0.0,
                    help="梯度裁剪 max-norm; 0=关闭(UNet baseline 口径)。Transformer 建议 1.0")
+    p.add_argument("--pos-grid", type=int, default=0, choices=[0, 4],
+                   help="给 UNet 额外拼 4 个正弦位置通道(全域归一化坐标的 sin/cos), 0=关闭。"
+                        "属模型内部输入, 不改变 20 通道数据合同")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--resume-from", default="",
                    help="从同一 --out 目录内的完整 last.pt 接续；--epochs 是续训后的累计目标 epoch")
     p.add_argument("--amp", action="store_true",
                    help="开启 bf16 autocast 混合精度(MI250X 上 1.5-2x 提速; bf16 range 够大, 无需 GradScaler)")
     p.add_argument("--eval-stride", type=int, default=1)
+    p.add_argument("--eval-after-train", action="store_true",
+                   help="训练结束后在同一作业内评测。默认关闭: 训练作业只出 ckpt, "
+                        "评测与出图统一在 login node 单独跑(单 rank 长时间评测会触发 NCCL 看门狗超时)")
     p.add_argument("--ensemble", type=int, default=1)
     p.add_argument("--ddim-steps", type=int, default=50)
     return p

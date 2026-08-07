@@ -3,6 +3,9 @@ runs/
 logs/
 oripaper/
 
+# 外部只读参考代码(上游 CorrDiff 适配管线 + NVIDIA PhysicsNeMo), 非本项目实现, 不对外发布
+code/era5_daymet/reference_corrdiff_official/
+
 # Python 字节码
 __pycache__/
 *.py[cod]

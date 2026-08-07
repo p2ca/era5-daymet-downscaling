@@ -454,8 +454,14 @@ def run(args):
     Cout = len(args.out_vars)
     Cin = TD.cond_channels(args.in_vars, args.out_vars, args.use_clim)   # 默认20通道; --use-clim=23
 
-    # 回归器: 与 train_unet.py 完全同构 -> 可直接载入已训好的 ckpt
-    regressor = TD.UNet(Cin, Cout, base=args.reg_base, temb=0).to(device)
+    # 回归器: 与 train_unet.py 完全同构 -> 可直接载入已训好的 ckpt。
+    # base/pos_grid 必须与该 ckpt 训练时一致, 故复用现成回归器时一律以 ckpt 内记录的为准。
+    reg_base, reg_pos_grid = args.reg_base, args.reg_pos_grid
+    if args.regressor_ckpt:
+        ra = torch.load(args.regressor_ckpt, map_location="cpu").get("args", {})
+        reg_base = int(ra.get("base", reg_base))
+        reg_pos_grid = int(ra.get("pos_grid", reg_pos_grid))
+    regressor = TD.UNet(Cin, Cout, base=reg_base, temb=0, pos_grid=reg_pos_grid).to(device)
     # 扩散去噪器: 输入 = [噪声(Cout) + cond(Cin) + μ(Cout)], 输出 = 残差(Cout)
     gen = TD.UNet(Cout + Cin + Cout, Cout, base=args.base, temb=128).to(device)
 
@@ -567,6 +573,8 @@ def main():
 
     # 模型
     p.add_argument("--reg-base", type=int, default=64, help="回归器 UNet base(与 train_unet 对齐)")
+    p.add_argument("--reg-pos-grid", type=int, default=0, choices=[0, 4],
+                   help="回归器的正弦位置通道数; 给了 --regressor-ckpt 时以 ckpt 内记录为准")
     p.add_argument("--base", type=int, default=64,
                    help="扩散器 UNet base。论文 Note3: 残差是局部/小尺度的 -> 扩散网可以更小")
     p.add_argument("--patch", type=int, default=192, help="必须被 FACTOR=6 整除")

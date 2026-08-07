@@ -33,7 +33,20 @@ def main():
     p = argparse.ArgumentParser(description="独立 UNet 降尺度训练 (DDP + 早停)",
                                 formatter_class=argparse.RawTextHelpFormatter)
     TD.add_common_args(p)                                  # 通用: 数据/年份/patch/lr/epochs/patience...
-    p.add_argument("--base", type=int, default=64, help="UNet 通道基数(指南 U1/U2/U3 = 64/128/192)")
+    p.add_argument("--base", type=int, default=64, help="UNet 通道基数(指南 U1/U2/U3 = 64/128/192); 仅 --arch unet")
+    # --- 结构选择 ---------------------------------------------------------
+    # arch=unet   : 2 次下采样、每级 1 个 ResBlock、无注意力, 由 --base 定规模(U1/U2/U3)
+    # arch=corrdiff: 层级/块数/瓶颈注意力可配, 参数名与 CorrDiff 侧口径一致
+    p.add_argument("--arch", choices=["unet", "corrdiff"], default="unet",
+                   help="确定性主体的结构族; 默认 unet(U1/U2/U3 baseline)")
+    p.add_argument("--model-channels", type=int, default=64,
+                   help="[corrdiff] 第 0 级通道数; 各级宽度 = 本值 x channel-mult")
+    p.add_argument("--channel-mult", type=int, nargs="+", default=[1, 2, 2, 2, 2],
+                   help="[corrdiff] 各级通道倍数; 长度决定层级数, 下采样次数 = 长度-1")
+    p.add_argument("--num-blocks", type=int, default=4,
+                   help="[corrdiff] 每级 ResBlock 数(解码器每级为本值+1)")
+    p.add_argument("--attn-bottleneck", type=int, choices=[0, 1], default=1,
+                   help="[corrdiff] 瓶颈自注意力开关; 代价随瓶颈 token 数平方增长")
     # 整幅训练(与 train_vit.py 同名参数一致): UNet 全卷积, 感受野 ~54px << crop 192, 故整幅与裁块
     # 学到的函数几乎相同; 用整幅是为了和整幅 ViT 对比时消除"空间采样方式"这个混杂变量。
     p.add_argument("--full-frame", action="store_true",
@@ -57,17 +70,24 @@ def main():
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
     Cin = TD.cond_channels(args.in_vars, args.out_vars, args.use_clim)  # bilinear(ERA5)+Δz+lc+lsm(+气候态 if --use-clim)
     Cout = len(args.out_vars)
-    model = TD.UNet(Cin, Cout, base=args.base, temb=0).to(device)
+    model = TD.build_regressor(Cin, Cout, args).to(device)
     n_par = sum(x.numel() for x in model.parameters())
     if rank == 0:
         mode = f"full-frame(epoch_frames={args.epoch_frames})" if args.full_frame else f"crop{args.patch}"
-        print(f"[UNet] {mode}  amp={'bf16' if args.amp else 'fp32'}  "
-              f"base={args.base}  Cin={Cin} Cout={Cout}  params={n_par/1e6:.1f}M  "
+        # 只打印当前 arch 真正参与建模的几何参数; 另一族的参数不参与, 打出来会误导
+        if args.arch == "corrdiff":
+            geom = (f"model_channels={args.model_channels} channel_mult={args.channel_mult} "
+                    f"num_blocks={args.num_blocks} attn_bottleneck={args.attn_bottleneck}")
+        else:
+            geom = f"base={args.base}"
+        print(f"[{type(model).__name__}] {mode}  amp={'bf16' if args.amp else 'fp32'}  "
+              f"arch={args.arch} {geom} pos_grid={args.pos_grid}  "
+              f"Cin={Cin} Cout={Cout} out_vars={args.out_vars}  params={n_par/1e6:.1f}M  "
               f"world={world}  train={args.train_years[0]}-{args.train_years[-1]}  "
               f"val={args.val_years}  test={args.test_year}  patience={args.patience}", flush=True)
 
     TD.fit_deterministic(model, stats, args, device, (rank, world, local, is_dist))
-    if rank == 0:
+    if args.eval_after_train and rank == 0:
         TD.evaluate(model, None, stats, args, device)      # diff=None -> 确定性评测
 
     if is_dist:

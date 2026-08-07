@@ -4,8 +4,8 @@
 """可行性实测(改造后版本): 整幅 720x1440 ViT 单样本前向+反向, 量峰值显存 + 单步耗时。
 
 与旧版区别: 直接构建新结构 ViT(2D sin-cos 固定位置编码 + PixelShuffle 上采样头, full_frame=True),
-不再加载老 crop ckpt / 插值 pos。输入 = 17 变量(DEFAULT_IN) -> Cin=23。目的是补测 handoff §5.4
-要求的"17 变量整幅显存/耗时", 确认 bf16 塞得下单卡 64G。
+不再加载老 crop ckpt / 插值 pos。输入 = 17 变量(DEFAULT_IN) -> Cin=23。目的是实测
+17 变量整幅的显存/耗时, 确认 bf16 塞得下单卡 64G。
 """
 import os, sys, time
 import torch, torch.nn as nn, torch.nn.functional as F

@@ -13,7 +13,7 @@ BCSD = 逐像素仿射 a*bilinear(ERA5)+b, 截距 b 吃下"时间不变的精细
 温度在 K, 降水在 log1p(mm)(对齐 BCSD 拟合空间)。
 输出: runs/exp/20260720-eda-bcsd-why/{bcsd_why.png, summary.json}
 """
-import os, sys, json
+import os, sys, json, argparse
 import numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 from era5_daymet.data import match_era5_daymet as M
@@ -24,21 +24,28 @@ from era5_daymet.paths import PROJECT_ROOT
 # 路径一律相对仓库根锚定, 从任何 cwd 运行都写入正式 runs/ (不再在 code/ 下误建目录)
 STATS  = str(PROJECT_ROOT / "runs/stats/train_dayofyear")
 COEFS  = str(PROJECT_ROOT / "runs/bcsd_coefs")
-OUTDIR = str(PROJECT_ROOT / "runs/exp/20260720-eda-bcsd-why")
-YEAR = 2020; STRIDE = 1; BOX = 384; FACTOR = 6   # STRIDE=1=全年(汇报口径); 调大只为快速探索
+FACTOR = 6
 VARS = ["2m_temperature_max", "2m_temperature_min", "total_precipitation_24hr"]
 LAB  = {"2m_temperature_max": "tmax (K)", "2m_temperature_min": "tmin (K)", "total_precipitation_24hr": "precip log1p(mm)"}
 PRECIP = "total_precipitation_24hr"
-os.makedirs(OUTDIR, exist_ok=True)
 logmm = lambda x: np.log1p(np.maximum(x, 0.0) * 1000.0)
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--year", type=int, default=2020)
+    ap.add_argument("--stride", type=int, default=1, help="1=全年(汇报口径); 调大只为快速探索")
+    ap.add_argument("--box", type=int, default=384, help="全陆地取样方块边长(px)")
+    ap.add_argument("--out", default=str(PROJECT_ROOT / "runs/exp/20260720-eda-bcsd-why"))
+    args = ap.parse_args()
+    YEAR, OUTDIR = args.year, args.out
+    os.makedirs(OUTDIR, exist_ok=True)
+
     stats = TD.Stats(STATS, VARS, VARS)
     d = TD.DownscaleData(M.ERA5_DIR, M.DAYMET_DIR, [YEAR], VARS, VARS, stats)
     up = make_bilinear(d.Hl, d.Wl, FACTOR)
-    mask = d.mask[YEAR]; by, bx, bs = TD.pick_land_box(mask, min(BOX, d.H, d.W))
-    days = list(range(0, d.ndays[YEAR], STRIDE))
+    mask = d.mask[YEAR]; by, bx, bs = TD.pick_land_box(mask, min(args.box, d.H, d.W))
+    days = list(range(0, d.ndays[YEAR], args.stride))
     print(f"[eda3] box=({by},{bx},{bs}) all-land={mask[by:by+bs,bx:bx+bs].all()}  {len(days)} days", flush=True)
 
     res = {}; bmaps = {}; climmaps = {}

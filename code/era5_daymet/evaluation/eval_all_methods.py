@@ -113,7 +113,7 @@ def build_predictors(methods, test, stats, args, device):
 
     if "unet" in methods:
         ck = _resolve_ckpt("unet", args); a = _load_ckpt_args(ck)
-        net_u = TD.UNet(Cin, Cout, base=a.get("base", 64), temb=0).to(device)
+        net_u = TD.build_regressor(Cin, Cout, a).to(device)
         net_u.load_state_dict(torch.load(ck, map_location=device)["model"]); net_u.eval()
 
         def f_unet(cond, t, _net=net_u):
