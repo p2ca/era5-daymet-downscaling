@@ -328,14 +328,25 @@ if torch is not None:
         raise ValueError(f"未知 arch: {arch!r} (可选: unet / corrdiff)")
 
 
-def crps_ensemble(members, truth, mask):
-    N = members.shape[0]; mb = mask > 0.5; out = []
+def crps_ensemble(members, truth, mask, per_pixel=False):
+    """集合 CRPS 的公平估计式 E|x-y| - 0.5*E|x-x'|, 逐通道在掩膜内取均值。
+
+    per_pixel=True 时改为返回 (标量列表, 逐像素场), 场形状 (C,)+mask.shape, 掩膜外为 NaN。
+    场与标量出自同一份计算, 标量恒等于场在掩膜内的均值。需要按区域、海拔或其他空间分层
+    聚合 CRPS 时必须取场: 标量已经把空间维平掉, 事后无法再拆回各分层的贡献。
+    """
+    N = members.shape[0]; mb = mask > 0.5; out = []; fields = []
     for c in range(truth.shape[0]):
         mem = members[:, c][:, mb]; y = truth[c][mb]
         t1 = np.abs(mem - y[None]).mean(0)
         t2 = np.abs(mem[:, None] - mem[None, :]).mean((0, 1)) if N > 1 else 0.0
-        out.append(float((t1 - 0.5 * t2).mean()))
-    return out
+        px = t1 - 0.5 * t2
+        out.append(float(px.mean()))
+        if per_pixel:
+            f = np.full(mb.shape, np.nan)
+            f[mb] = px
+            fields.append(f)
+    return (out, np.stack(fields, 0)) if per_pixel else out
 
 
 def rank_hist(members, truth, mask):
