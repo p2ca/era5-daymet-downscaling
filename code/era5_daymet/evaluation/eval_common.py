@@ -24,44 +24,13 @@ import numpy as np
 from era5_daymet.data import downscale_baseline as DB
 from era5_daymet import contract as C
 from era5_daymet.evaluation import metrics as MT
-from scipy.ndimage import binary_erosion
-from skimage.metrics import structural_similarity as _ssim
+# SSIM 的实现与口径常量集中在 evaluation.metrics; 此处按旧名转发, 保持既有调用点可用。
+from era5_daymet.evaluation.metrics import (        # noqa: F401
+    ssim_masked, eroded_land_mask, SSIM_SIGMA, SSIM_ERODE)
 
 PRECIP = C.PRECIP
 
 # --- SSIM 的三个口径, 定死在这里, 免得各处不一致 ---
-SSIM_SIGMA = 1.5          # Wang et al. 原始 SSIM: 11x11 高斯窗, sigma=1.5
-SSIM_ERODE = 5            # 陆地掩膜腐蚀半径(px): 海岸窗口会吃到填充值, 剔掉
-
-
-def ssim_masked(pred, truth, mb, mb_er):
-    """陆地上的 SSIM。
-
-    ★三个必须交代的口径决定(SSIM 对这些极其敏感, 不写清楚数字就没法复现):
-
-    1) 海洋怎么办: SSIM 是局部窗口算的, 窗口一旦跨过海岸线就会吃到无效值。
-       这里把 pred 和 truth 的非陆地区域填成★同一个值★(当日陆地均值) ——
-       两边填一样 -> 不引入任何人为的结构差异; 再把 SSIM 图只在★腐蚀过★的陆地
-       掩膜上平均(腐蚀半径 5px > 高斯窗半径), 彻底避开被填充值污染的海岸窗口。
-       (若填不同值, 或不腐蚀直接在全陆地上平均, 海岸带会凭空产生结构差, 分数失真。)
-
-    2) data_range: SSIM 的 C1/C2 正比于动态范围 L。这里取★当日 truth 在陆地上的
-       max-min★。同一天里所有方法共用同一个 L -> ★方法之间的比较是公平的★
-       (这正是我们要的); 跨天的 L 不同, 但最后是对天平均, 不影响方法排序。
-
-    3) 公式: 高斯窗(sigma=1.5) + use_sample_covariance=False, 即 Wang 2004 原版,
-       不是 skimage 的 7x7 均匀窗默认值。
-    """
-    fill = float(truth[mb].mean())
-    p = np.where(mb, pred, fill).astype(np.float64)
-    t = np.where(mb, truth, fill).astype(np.float64)
-    dr = float(truth[mb].max() - truth[mb].min())
-    if dr <= 0:
-        return 1.0                                     # 该日陆地上是常数场(退化), 定义为完全相似
-    _, S = _ssim(t, p, data_range=dr, gaussian_weights=True, sigma=SSIM_SIGMA,
-                 use_sample_covariance=False, full=True)
-    m = mb_er if mb_er.any() else mb
-    return float(S[m].mean())
 
 
 class MultiMethodEval:
@@ -98,7 +67,7 @@ class MultiMethodEval:
             # ★功率谱改为★全年累加求平均★(不再只取首日快照); 首日把累加器初始化为 0
             self.spec["truth"] = {v: 0.0 for v in self.ov}
         if self.mb_er is None:
-            self.mb_er = binary_erosion(mb, iterations=SSIM_ERODE)
+            self.mb_er = eroded_land_mask(mb)
         by, bx, bs = self.box; first = (self.nd == 0)
         self.tsum += hr; self.nd += 1
         for i, v in enumerate(self.ov):                          # 累加 truth 功率谱(全年平均, _plots 里除以 nd)
