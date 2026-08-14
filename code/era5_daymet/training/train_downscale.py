@@ -42,6 +42,11 @@ from era5_daymet.data.downscale_baseline import (
 )
 from era5_daymet.data.compute_norm_stats import slot_index
 from era5_daymet.paths import PROJECT_ROOT
+# 数据合同(通道顺序/目标/倍率/降水单位空间)的定义处是 era5_daymet.contract;
+# 此处按旧名转发, 使既有 TD.xxx 调用点保持可用, 新代码请直接从 contract 导入。
+from era5_daymet.contract import (                     # noqa: F401
+    FACTOR, TARGETS, PRECIP, DEFAULT_IN, PRECIP_LOG_MAX,
+    cond_channels, precip_fwd, precip_inv)
 # 评测原语与分块推理已迁至各自归属的模块; 此处按旧名转发, 使既有 TD.xxx 调用点保持可用。
 # 新代码请直接从 era5_daymet.evaluation.metrics / era5_daymet.models.tiled_inference 导入。
 from era5_daymet.evaluation.metrics import (          # noqa: F401
@@ -56,56 +61,6 @@ try:
     from torch.nn.parallel import DistributedDataParallel as DDP
 except Exception:
     torch = None
-
-FACTOR = 6
-TARGETS = ["2m_temperature_max", "2m_temperature_min", "total_precipitation_24hr"]
-
-
-def precip_fwd(p, clip, scale):
-    """降水建模空间: ×scale 变毫米 -> drizzle clip -> log1p(与 compute_norm_stats 一致)。"""
-    p = np.maximum(p, 0.0) * scale
-    p = np.where(p < clip, 0.0, p)
-    return np.log1p(p)
-
-
-# log1p(mm) 的物理上界: 世界日降水纪录约 1825 mm -> log1p ≈ 7.51。取 8.0 (≈2980 mm) 已极宽松。
-PRECIP_LOG_MAX = 8.0
-
-
-def precip_inv(x, scale, max_log=PRECIP_LOG_MAX, return_clipped=False):
-    """log1p(mm) -> m/day。
-
-    ★必须钳制★: 这是 expm1, 是指数函数。生成式模型(扩散)的样本有重尾, 只要有★一个★
-    离群像素(比如 log 空间值 50), expm1(50)≈5e21 就会把整幅图的 RMSE 炸成 inf。
-    确定性方法从不触发这个 —— L2 损失把它们的输出压得很平, 永远到不了那个量级 ——
-    只有生成式模型才会走到需要钳制的区间。
-
-    钳到 8.0 对任何真实降水都是无操作(远超世界纪录), 因此不改变任何已记录的确定性结果;
-    它只在生成式模型吐出物理上不可能的值时兜底。return_clipped=True 会一并返回被钳的
-    像素比例 —— 这个数字本身是个诊断: 训练良好的模型应该≈0, 若显著>0 就是红旗。
-    """
-    n_clip = float(np.mean(x > max_log)) if return_clipped else 0.0
-    p = np.maximum(np.expm1(np.minimum(x, max_log)), 0.0) / scale
-    return (p, n_clip) if return_clipped else p
-
-# ★输入合同: 17 ERA5 动态变量, ★必须严格按此顺序读取★。
-#   加 3 静态(dz/lc/lsm) => 条件通道 = 17+3 = 20(默认)。
-#   --use-clim 可选保留 3 个逐日气候态通道 -> 23 通道(仅用于复现早期 23 通道实验)。
-DEFAULT_IN = ["2m_temperature", "2m_temperature_max", "2m_temperature_min",
-              "total_precipitation_24hr", "10m_u_component_of_wind", "10m_v_component_of_wind",
-              "volumetric_soil_water_layer_1", "geopotential_500", "geopotential_850",
-              "specific_humidity_500", "specific_humidity_850", "temperature_500", "temperature_850",
-              "u_component_of_wind_500", "u_component_of_wind_850",
-              "v_component_of_wind_500", "v_component_of_wind_850"]
-PRECIP = "total_precipitation_24hr"
-
-
-def cond_channels(in_vars, out_vars, use_clim):
-    """条件输入通道数: len(ERA5 动态) + 3 静态(dz/lc/lsm) + (气候态 = len(out_vars) if use_clim)。
-    默认 use_clim=False -> 20 通道(指南口径); use_clim=True -> 23(旧口径)。
-    训练/评测/构模所有地方都用它, 保证与 DownscaleData.get_patch 拼出的 cond 通道数一致。"""
-    return len(in_vars) + 3 + (len(out_vars) if use_clim else 0)
-
 
 # ===========================================================================
 # 1. 训练集统计 + 气候态(只加载, 不重算)
