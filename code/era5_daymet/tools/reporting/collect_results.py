@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 
 from era5_daymet.paths import PROJECT_ROOT
@@ -192,6 +193,65 @@ def spec_contract():
     return L
 
 
+def audit(metas):
+    """把 meta.json 的自述与实验目录里的产物对拍, 返回 (实验 ID, 问题) 列表。
+
+    meta.json 是人写的, loss_history.json 与 checkpoint 是训练进程写的。两者一旦分叉,
+    本脚本会照抄 meta 的那一份 —— 生成物忠实反映输入, 不会自己发现输入是错的。这里做
+    只读对拍, 不修改任何 meta: 谁写的谁负责改, 但必须让分叉在 STATUS 里可见。
+
+    比较用容差而非严格相等: 验证点每 val_every 个 samples 才落一个, 训练可以停在两个
+    验证点之间, 因此 samples_trained 合法地略大于曲线末点, 差值应小于一个验证间隔。
+    """
+    out = []
+    for m in metas:
+        d = os.path.join(EXP, m["_dir"])
+        hp = os.path.join(d, "loss_history.json")
+        tr = m.get("training") or {}
+        status = str(m.get("status", ""))
+
+        if os.path.exists(hp):
+            try:
+                with open(hp) as f:
+                    hist = json.load(f)
+            except (OSError, ValueError):
+                hist = []
+            if hist:
+                every = int(tr.get("val_every") or 0)
+                last_n = int(hist[-1].get("samples", 0))
+                best = min(hist, key=lambda x: x.get("val", float("inf")))
+                claim_n = tr.get("samples_trained")
+                if claim_n is not None:
+                    gap = int(claim_n) - last_n
+                    if gap < 0 or (every and gap >= every):
+                        out.append((m["_dir"], f"meta 记 samples_trained {int(claim_n):,}, "
+                                    f"曲线末点 {last_n:,} (差 {gap:,}, 超出一个验证间隔 {every:,})"))
+                claim_v = tr.get("best_val")
+                if claim_v is not None and best.get("val") is not None:
+                    # 按 meta 自己声明的精度比较: meta 合法地记四舍五入值(如 0.05259),
+                    # 用绝对容差会把"精度不同"误报成"数值不符"。问的是"在它声称的精度下是否一致"。
+                    dec = len(str(claim_v).split(".")[-1]) if "." in str(claim_v) else 0
+                    if round(float(best["val"]), dec) != round(float(claim_v), dec):
+                        out.append((m["_dir"], f"meta 记 best_val {claim_v}, "
+                                    f"曲线最优 {best['val']:.6f} @ {int(best['samples']):,}"))
+                claim_at = tr.get("best_val_at_samples")
+                # 样本数是整数, 无舍入余地, 严格比较
+                if claim_at is not None and int(claim_at) != int(best.get("samples", -1)):
+                    out.append((m["_dir"], f"meta 记 best_val_at_samples {int(claim_at):,}, "
+                                f"曲线最优点在 {int(best.get('samples', -1)):,}"))
+
+        if status.startswith("running"):
+            # 训练进程会持续写 last.pt; 长时间不动而 status 仍是 running, 多半是作业早已结束
+            lp = os.path.join(d, "last.pt")
+            if os.path.exists(lp):
+                idle_h = (time.time() - os.path.getmtime(lp)) / 3600.0
+                if idle_h > 3.0:
+                    out.append((m["_dir"], f"status 仍是 running, 但 last.pt 已 {idle_h:.1f} 小时未更新"))
+            else:
+                out.append((m["_dir"], "status 是 running, 但目录里没有 last.pt"))
+    return out
+
+
 def build_status(metas):
     L = ["# 当前状态 (STATUS)\n",
          "> 本文件负责：汇总现行数据合同、现行基线指标与在途工作，供新 session 单点读取；"
@@ -259,6 +319,15 @@ def build_status(metas):
         L.append("")
     else:
         L.append("_无。_\n")
+
+    issues = audit(metas)
+    if issues:
+        L += ["## 3.5 待核对（meta.json 与产物对不上）\n",
+              "> 以下是 meta.json 的自述与实验目录里 `loss_history.json` / `last.pt` 的对拍结果。",
+              "> 本表由脚本对拍生成, 不代表实验有问题, 但**引用这些实验的数字前必须先核对**。\n",
+              "| 实验 ID | 分歧 |", "|---|---|"]
+        L += [f"| `{d}` | {msg} |" for d, msg in issues]
+        L.append("")
 
     n_sup = sum(1 for m in metas if "supersed" in str(m.get("status", "")))
     L += ["## 4. 更细的东西去哪查\n",
