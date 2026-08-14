@@ -30,9 +30,8 @@ import zipfile
 
 import numpy as np
 
+from era5_daymet.contract import FACTOR
 from era5_daymet.data import match_era5_daymet as M  # noqa: F401
-
-FACTOR = 6
 LAT_EDGES = (23.625, 53.625)
 LON_EDGES = (-125.125, -65.125)
 PRECIP = "total_precipitation_24hr"
