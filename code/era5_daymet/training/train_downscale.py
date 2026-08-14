@@ -42,6 +42,12 @@ from era5_daymet.data.downscale_baseline import (
 )
 from era5_daymet.data.compute_norm_stats import slot_index
 from era5_daymet.paths import PROJECT_ROOT
+# 评测原语与分块推理已迁至各自归属的模块; 此处按旧名转发, 使既有 TD.xxx 调用点保持可用。
+# 新代码请直接从 era5_daymet.evaluation.metrics / era5_daymet.models.tiled_inference 导入。
+from era5_daymet.evaluation.metrics import (          # noqa: F401
+    crps_ensemble, rank_hist, radial_psd, pick_land_box)
+from era5_daymet.models.tiled_inference import (       # noqa: F401
+    det_predict, _feather_window)
 
 try:
     import torch
@@ -326,51 +332,6 @@ if torch is not None:
                                 attn_bottleneck=bool(int(get("attn_bottleneck", 1))),
                                 pos_grid=pos_grid, temb=temb)
         raise ValueError(f"未知 arch: {arch!r} (可选: unet / corrdiff)")
-
-
-def crps_ensemble(members, truth, mask, per_pixel=False):
-    """集合 CRPS 的公平估计式 E|x-y| - 0.5*E|x-x'|, 逐通道在掩膜内取均值。
-
-    per_pixel=True 时改为返回 (标量列表, 逐像素场), 场形状 (C,)+mask.shape, 掩膜外为 NaN。
-    场与标量出自同一份计算, 标量恒等于场在掩膜内的均值。需要按区域、海拔或其他空间分层
-    聚合 CRPS 时必须取场: 标量已经把空间维平掉, 事后无法再拆回各分层的贡献。
-    """
-    N = members.shape[0]; mb = mask > 0.5; out = []; fields = []
-    for c in range(truth.shape[0]):
-        mem = members[:, c][:, mb]; y = truth[c][mb]
-        t1 = np.abs(mem - y[None]).mean(0)
-        t2 = np.abs(mem[:, None] - mem[None, :]).mean((0, 1)) if N > 1 else 0.0
-        px = t1 - 0.5 * t2
-        out.append(float(px.mean()))
-        if per_pixel:
-            f = np.full(mb.shape, np.nan)
-            f[mb] = px
-            fields.append(f)
-    return (out, np.stack(fields, 0)) if per_pixel else out
-
-
-def rank_hist(members, truth, mask):
-    N = members.shape[0]; mb = mask > 0.5
-    mem = members[:, 0][:, mb]; y = truth[0][mb]
-    ranks = (mem < y[None]).sum(0) + np.random.randint(0, 2, y.shape) * (mem == y[None]).sum(0)
-    h, _ = np.histogram(ranks, bins=np.arange(N + 2))
-    return (h / h.sum())
-
-
-def radial_psd(img, sz):
-    img = img - img.mean(); w = np.hanning(img.shape[0])[:, None] * np.hanning(img.shape[1])[None, :]
-    P = np.abs(np.fft.fftshift(np.fft.fft2(img * w))) ** 2
-    c0, c1 = np.array(P.shape) // 2; Y, X = np.indices(P.shape); r = np.hypot(Y - c0, X - c1).astype(int)
-    return np.bincount(r.ravel(), P.ravel()) / np.maximum(np.bincount(r.ravel()), 1)
-
-
-def pick_land_box(mask, sz):
-    ys, xs = np.where(mask)
-    if len(ys) == 0: return (0, 0, sz)
-    for y0 in range(ys.min(), max(ys.min() + 1, ys.max() - sz), 40):
-        for x0 in range(xs.min(), max(xs.min() + 1, xs.max() - sz), 40):
-            if mask[y0:y0 + sz, x0:x0 + sz].all(): return (y0, x0, sz)
-    return (int(ys.min()), int(xs.min()), sz)
 
 
 def save_loss_history(out, history, plot=False):
@@ -958,47 +919,6 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
         for p in model.parameters():
             dist.broadcast(p.data, src=0)
     return ckpt
-
-
-def _feather_window(tile, ov):
-    """羽化窗口 (tile,tile): 块边缘的 ov 像素线性降权, 内部为 1。
-
-    ★为什么: 分块推理时若用★均匀平均★(每块权重相同), 重叠区覆盖数从 1 跳到 2 不连续,
-    且每块在自己边缘处上下文最少、预测最差 -> 拼出规则的"一格一格"接缝。羽化窗口让
-    每块只在重叠带里平滑过渡, 边缘降权、内部满权, 接缝被抹平。
-    ★最小权重 = 1/(ov+1) > 0 (不到 0): 保证域边界(只被单块覆盖处)除法不为 0、且恢复原值。
-    """
-    r = (np.arange(ov) + 1) / (ov + 1)                     # (0,1) 之间, 不含端点
-    w1 = np.ones(tile, np.float32)
-    w1[:ov] = r; w1[-ov:] = r[::-1]
-    return np.outer(w1, w1).astype(np.float32)             # (tile,tile)
-
-
-def det_predict(model, cond, tile, device, tile_batch=32):
-    """确定性预测 -> (Cout,H,W) numpy。tile=0: 整帧(全卷积 UNet); tile>0: 分块+★羽化加权融合★(ViT 必须, 固定 token 数)。
-
-    tile>0 时按 tile_batch 攒批前向: 720x1440 在 tile=60 下数百块, 逐块 batch=1 会让 GPU
-    空转在 kernel launch 上。攒批与逐块数值等价。
-    融合用羽化窗口加权(见 _feather_window), 而非均匀平均 -> 消除分块接缝的"一格一格"。
-    """
-    if not tile:
-        return model(cond)[0].detach().cpu().numpy()
-    _, _, H, W = cond.shape; ov = max(tile // 4, 1); step = max(tile - ov, 1)
-    win = _feather_window(tile, ov)                        # (tile,tile) 加权窗口
-    ys = sorted(set(list(range(0, max(1, H - tile + 1), step)) + [max(0, H - tile)]))
-    xs = sorted(set(list(range(0, max(1, W - tile + 1), step)) + [max(0, W - tile)]))
-    coords = [(y0, x0) for y0 in ys for x0 in xs]
-    out = wsum = None
-    for i in range(0, len(coords), tile_batch):
-        chunk = coords[i:i + tile_batch]
-        crops = torch.cat([cond[:, :, y0:y0 + tile, x0:x0 + tile] for y0, x0 in chunk], 0)
-        pred = model(crops).detach().cpu().numpy()
-        if out is None:
-            out = np.zeros((pred.shape[1], H, W), np.float32); wsum = np.zeros((H, W), np.float32)
-        for (y0, x0), p in zip(chunk, pred):
-            out[:, y0:y0 + tile, x0:x0 + tile] += p * win[None]      # ★加权累加
-            wsum[y0:y0 + tile, x0:x0 + tile] += win
-    return out / np.maximum(wsum, 1e-6)[None]
 
 
 # ===========================================================================
