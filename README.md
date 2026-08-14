@@ -1,70 +1,135 @@
-# ERA5–Daymet Downscaling Code Guide
+# ERA5–Daymet Downscaling
 
-本仓库用于代码检查；当前维护的实现集中在 `code/era5_daymet/`。代码主流程为：
+把 ERA5 再分析（0.25°，120×240）降尺度到 Daymet 观测网格（2.5 arcmin，720×1440）的 CONUS
+实验代码，空间倍率 6×。三条基线并行比较：统计方法（插值 / BCSD）、确定性神经网络
+（UNet / ViT）、生成式模型（NVIDIA CorrDiff 的两阶段残差扩散）。
 
-`数据匹配与统计 → 模型训练 → 统一评估 → 专项诊断与汇报`
+## 任务设置
 
-## 训练与模型
+| 项 | 设置 |
+|---|---|
+| 条件输入 | 20 通道 = 17 个 ERA5 动态变量（双线性上采样 6×）+ 3 个 Daymet 静态场（Δz / landcover / land_sea_mask） |
+| 预测目标 | tmax、tmin、24 小时降水 |
+| 数据划分 | train 1980–2017 / val 2018–2019 / test 2020，365 天历 |
+| 降水处理 | ×1000 → mm → <0.1 mm 置零 → log1p → z-score；评测时逆变换 |
+| 有效域 | 只在 Daymet 陆地掩膜上计算 loss 与指标 |
+
+降水在 `log1p(mm)` 与 `m/day` 两种空间都评测过，两者的 RMSE 之间没有换算关系，排名甚至相反；
+跨方法比较前必须确认单位空间一致。
+
+## 代码布局
+
+维护中的实现全部在 `code/era5_daymet/` 包内；`code/` 下的零散 `.py` 只是旧命令的兼容入口，
+不放新实现。
+
+```text
+era5_daymet/
+├── contract.py    数据合同: 通道顺序、目标变量、空间倍率、降水单位空间
+├── data/          数据发现、读写、取数与归一化统计
+├── models/        SongUNet、EDM preconditioning、patching、JiT 主干、分块推理等模型组件
+├── training/      确定性、ViT、UNet、SCD、CorrDiff 与 JiT 的训练入口
+├── baselines/     统计基线与 BCSD
+├── evaluation/    打分原语、多方法统一评估与采样落盘
+├── tools/
+│   ├── preprocessing/
+│   ├── diagnostics/
+│   ├── plotting/
+│   └── reporting/
+└── tests/
+    └── distributed/
+```
+
+### 训练与模型
 
 | 功能 | 代码 | 主要职责 |
 |---|---|---|
-| 共享训练核心 | `training/train_downscale.py` | 定义数据集与 DataLoader、归一化、UNet 主体、分布式训练、切片推理和公共评估流程 |
-| UNet | `training/train_unet.py` | UNet baseline 的训练入口 |
-| ViT crop / global | `training/train_vit.py` | 定义 ViT、Transformer block、位置编码和上采样结构，并负责 crop 与 full-frame/global 两种训练方式 |
-| CorrDiff | `training/train_corrdiff.py` | 两阶段 CorrDiff：确定性均值模型、残差扩散训练和集合采样 |
-| SCD | `training/train_scd.py` | Scale-Consistent Decomposition 扩散模型训练 |
-| 序列并行注意力 | `models/seq_parallel_attn.py` | global ViT 使用的 sequence-parallel attention、切分/聚合与梯度同步 |
+| 共享训练核心 | `training/train_downscale.py` | 分布式初始化、训练与验证循环、断点续训契约、命令行参数；数据合同、取数、打分原语与分块推理已各自独立成模块，此处按旧名转发以兼容既有调用 |
+| 数据合同 | `contract.py` | 17 个 ERA5 动态通道的强制顺序、目标变量、空间倍率、降水 log1p 变换与钳制上界 |
+| UNet | `training/train_unet.py` | UNet baseline 训练入口 |
+| ViT crop / global | `training/train_vit.py` | ViT、Transformer block、位置编码与上采样头；crop 与 full-frame 两种训练方式 |
+| CorrDiff | `training/train_corrdiff.py`、`training/train_stage_b.py` | 两阶段 CorrDiff：确定性均值模型、残差扩散训练与集合采样 |
+| JiT / JiTMoE | `training/train_jit.py`、`models/jit_backbone.py`、`models/moe_ffn.py`、`models/jit_sampler.py` | 整幅像素空间条件扩散（x-prediction + v 空间损失），可选 DeepSeek 风格稀疏 FFN |
+| SCD | `training/train_scd.py` | Scale-Consistent Decomposition 扩散模型 |
+| 序列并行注意力 | `models/seq_parallel_attn.py` | global ViT 的 sequence-parallel attention、切分/聚合与梯度同步 |
 
-## 数据与统计基线
+`models/` 下的 `song_unet.py`、`preconditioning.py`、`patching.py`、`stochastic_sampler.py`
+移植自 NVIDIA PhysicsNeMo（Apache-2.0），`tests/test_vendored_equivalence.py` 以「同权重下
+输出逐比特相同」作为移植可信度的依据。
+
+### 数据与统计基线
 
 | 功能 | 代码 | 主要职责 |
 |---|---|---|
-| ERA5–Daymet 数据匹配 | `data/match_era5_daymet.py` | 查找并按日期配对 ERA5 与 Daymet 文件，定义数据年份划分和匹配流程 |
-| 训练集统计量 | `data/compute_norm_stats.py` | 仅使用训练年份计算均值、标准差和气候态统计量 |
-| 公共数据工具 | `data/downscale_baseline.py` | 提供文件读取、插值、掩膜、单位转换和基础指标等底层函数 |
-| 统计降尺度 baseline | `baselines/train_statistical.py` | 训练并评估插值和 BCSD 等统计方法 |
+| ERA5–Daymet 数据匹配 | `data/match_era5_daymet.py` | 按日期配对 ERA5 与 Daymet 文件，定义年份划分 |
+| 训练集统计量 | `data/compute_norm_stats.py` | 仅用训练年份计算均值、标准差与气候态统计 |
+| 取数与归一化统计 | `data/dataset.py` | `Stats` 加载训练集统计与气候态；`DownscaleData` 按年持有场并切出 (cond, target, mask, 原值真值)，训练与评测共用同一实现 |
+| 公共数据工具 | `data/downscale_baseline.py` | 文件读取、插值、掩膜、单位转换与基础指标 |
+| 统计降尺度 | `baselines/train_statistical.py` | 训练并评估插值与 BCSD |
 | BCSD 系数拟合 | `baselines/fit_bcsd_coefs.py` | 拟合并保存逐网格 BCSD 参数 |
 
-## 评估
+### 评估与诊断
 
 | 功能 | 代码 | 主要职责 |
 |---|---|---|
-| 统一评估工具 | `evaluation/eval_common.py` | 汇总 RMSE、MAE、bias、correlation、CRPS、SSIM、频谱和空间图等公共评估逻辑 |
-| 多模型统一评估 | `evaluation/eval_all_methods.py` | 在相同日期、单位和指标口径下比较统计方法、UNet、ViT 与 CorrDiff |
-| BCSD 双空间评估 | `evaluation/eval_bcsd_both_spaces.py` | 同时在降水物理空间与 `log1p` 空间评估 BCSD |
+| 打分原语 | `evaluation/metrics.py` | 集合 CRPS（含逐像素场）、名次直方图、径向功率谱、分析窗口选取；纯 numpy |
+| 分块推理 | `models/tiled_inference.py` | 确定性模型的整帧/分块预测与羽化加权融合，训练验证与评测共用 |
+| 统一评估工具 | `evaluation/eval_common.py` | RMSE、MAE、bias、correlation、CRPS、SSIM、频谱与空间图 |
+| 多模型统一评估 | `evaluation/eval_all_methods.py` | 同日期、同单位、同指标口径下比较各方法 |
+| BCSD 双空间评估 | `evaluation/eval_bcsd_both_spaces.py` | 同时在物理空间与 `log1p` 空间评估 BCSD |
+| CorrDiff 阶段 B 检验 | `tools/diagnostics/stage_b_big_check.py` | rank histogram、功率谱、逐月 CRPS/CRPSS、spread-skill、逐像素 CRPS |
+| 分层与区域诊断 | `tools/diagnostics/stratified_eval.py`、`regional_seasonal_eval.py` | 按高程/起伏/离海距离与命名区域×逐月的多方法对比 |
+| 绘图与汇报 | `tools/plotting/`、`tools/reporting/` | 结果图与指标汇总 |
 
-## 数据预处理
+## 代码所有权
 
-| 功能 | 代码 |
-|---|---|
-| 将 ERA5 有效区域与 Daymet 网格对齐 | `tools/preprocessing/align_era5_to_daymet.py` |
-| 提取固定样例帧供模型对比 | `tools/preprocessing/extract_golden_frames.py` |
-| 补齐测试集中缺失的 ERA5 最后一天 | `tools/preprocessing/fill_era5_lastday.py` |
+多个协作 session 并行工作时按下表划分改动权限。分档依据是"改动的影响范围"，不是目录名：
 
-## ViT global 诊断
+| 档 | 范围 | 规则 |
+|---|---|---|
+| 训练侧 | `training/**`、`code/submit/**` | 训练 session 自主改动 |
+| 评测侧 | `evaluation/**`、`tools/plotting/**`、`tools/reporting/**`、`tools/diagnostics/**` | 评测 session 自主改动 |
+| 共管 | `contract.py`、`data/**`、`models/**`、`paths.py` | 改动前需两侧确认 |
+| 只读引入 | `models/song_unet.py`、`preconditioning.py`、`patching.py`、`stochastic_sampler.py` | 移植自上游，不改动 |
 
-| 功能 | 代码 |
-|---|---|
-| 计算并绘制 ViT crop/global 的网格相位 bias | `tools/diagnostics/diagnose_vit_gridphase_bias.py` |
-| 检查 ViT 网格结构与降水网格结构 | `tools/diagnostics/_eda_vit_grid.py`、`tools/diagnostics/_eda_vit_grid_precip.py` |
-| 检查边界接缝和阶梯状误差 | `tools/diagnostics/_r0_seam_zoom.py`、`tools/diagnostics/_r0_staircase_check.py` |
-| 探测 full-frame ViT 的数据与前向行为 | `tools/diagnostics/_probe_fullframe_vit.py` |
-| 生成全年模型图并补充 ViT global | `tools/diagnostics/_annual_individual_maps.py`、`tools/diagnostics/_annual_vit_global.py` |
+共管区之所以单列：`runs/STATUS.md` 的数据合同段由脚本从 `contract.py` 的常量派生，改动会让
+该文件自动跟着变，而已记录实验的元数据不会——两者一旦分叉，跨实验比较就在无声地失效。
+同理，`data/dataset.py` 决定条件通道的拼接顺序与降水变换，任一侧另起炉灶都会让验证集与
+测试集的输入口径分叉。
 
-## 其他分析、绘图与汇报工具
+方法特有的输入组装不在共管区：JiT 把加噪目标与条件拼成 21 通道在 `models/jit_backbone.py`，
+CorrDiff 阶段 B 叠加 μ、全域插值与位置网格在 `models/patching.py` 与 `song_unet.py`，两者互不影响。
 
-| 功能 | 代码 |
-|---|---|
-| 数据局部性、误差分解和模型机制分析 | `tools/diagnostics/_eda_task_locality.py`、`_eda_error_decomp.py`、`_eda_bcsd_why.py`、`_eda_corrdiff.py` |
-| 模型上限、频谱和统一诊断 | `tools/diagnostics/_eda_ceiling.py`、`_eda_unified.py` |
-| 全幅降水对比图 | `tools/diagnostics/_full_precip_map.py`、`_full_precip_maps_all_vit.py` |
-| 日常数据与模型结果绘图 | `tools/plotting/` |
-| 汇总评估结果并更新 HTML 指标表 | `tools/reporting/` |
+## 运行
 
-## 分布式测试
+```bash
+python -m era5_daymet.training.train_vit --help          # 从 code/ 目录
+python -m era5_daymet.evaluation.eval_all_methods --help
+python code/train_vit.py --help                          # 旧路径仍可用
+```
 
-`tests/distributed/` 用于验证 sequence parallel 的通信、网格划分、收敛性和 ViT 端到端行为。
+包内新增 import 一律用绝对路径：
 
-## 路径入口
+```python
+from era5_daymet.training.train_downscale import FullFrameDS
+```
 
-`paths.py` 统一提供代码目录和项目目录定位，供包内工具使用。
+## 测试
+
+```bash
+python -m era5_daymet.tests.test_spec_contract       # 固定数据合同（通道/顺序/划分/降水管线）
+python -m era5_daymet.tests.test_worker_sampling     # DataLoader 采样唯一性与分片
+python -m era5_daymet.tests.test_crps_per_pixel      # CRPS 逐像素分解与分层可加性
+python -m era5_daymet.tests.test_vendored_equivalence  # 移植代码与官方实现等价
+python -m era5_daymet.tests.test_jit_moe             # DSMoE 稀疏 FFN 对拍与路由不变量
+python -m era5_daymet.tests.test_jit_backbone        # JiT 主干几何与初始化契约
+python -m era5_daymet.tests.test_jit_sampler         # ODE 采样解析检验与分布回收
+python -m era5_daymet.tests.test_jit_resume          # train_jit 断点接力逐位复现与取帧分片
+torchrun --nproc_per_node=2 -m era5_daymet.tests.test_jit_ddp_sync  # train_jit DDP 同步正反对照
+```
+
+`tests/distributed/` 用于验证 sequence parallel 的通信、网格划分与收敛性。
+
+## 依赖
+
+Python 3.11 + PyTorch（ROCm 或 CUDA）、numpy、scipy、matplotlib、xarray、netCDF4。
+训练使用 AMP bfloat16。
