@@ -38,7 +38,9 @@ from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.evaluation import ablation_groups as AB
 from era5_daymet.evaluation.stageb_dump import apply_ablation, days_in_months
 from era5_daymet.models.jit_sampler import generate
-from era5_daymet.training import train_downscale as TD
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
+from era5_daymet.evaluation import metrics as MT
 from era5_daymet.training.train_jit import build_model
 
 
@@ -88,12 +90,12 @@ def main():
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     args = ck["args"]
     target = args["target"]
-    ti = TD.TARGETS.index(target)
-    is_precip = target == TD.PRECIP
+    ti = C.TARGETS.index(target)
+    is_precip = target == C.PRECIP
 
-    stats = TD.Stats(args["stats_dir"], TD.DEFAULT_IN, TD.TARGETS)
-    dd = TD.DownscaleData(args["era5_dir"], args["daymet_dir"], list(a.years),
-                          TD.DEFAULT_IN, TD.TARGETS, stats)
+    stats = DS.Stats(args["stats_dir"], C.DEFAULT_IN, C.TARGETS)
+    dd = DS.DownscaleData(args["era5_dir"], args["daymet_dir"], list(a.years),
+                          C.DEFAULT_IN, C.TARGETS, stats)
     H, W = dd.H, dd.W
     net = build_model(args, (H, W))
     sd = dict(ck["model"])
@@ -107,8 +109,8 @@ def main():
     if a.ablate_mode == "doy":
         if a.doy_year in a.years:
             raise ValueError("--doy-year 不得与 --years 重合")
-        donor = TD.DownscaleData(args["era5_dir"], args["daymet_dir"], [a.doy_year],
-                                 TD.DEFAULT_IN, TD.TARGETS, stats)
+        donor = DS.DownscaleData(args["era5_dir"], args["daymet_dir"], [a.doy_year],
+                                 C.DEFAULT_IN, C.TARGETS, stats)
 
     days = days_in_months(a.years, a.months) if a.months else \
         [(y, t) for y in a.years for t in range(365)]
@@ -116,7 +118,7 @@ def main():
         days = days[:a.max_days]
     all_days = days
     mine = days[rank::ntasks]
-    slots = {g: AB.channel_slots(AB.resolve(g), TD.DEFAULT_IN) for g in groups}
+    slots = {g: AB.channel_slots(AB.resolve(g), C.DEFAULT_IN) for g in groups}
     month_of = {y: np.array([x.month for x in M.daymet_dates(y)], int) for y in a.years}
 
     acc = {g: np.zeros((12, H, W), np.float32) for g in groups}
@@ -157,17 +159,17 @@ def main():
             mem = np.stack(mem, 0)
 
             if is_precip and stats.precip_log:
-                mem_phys = TD.precip_inv(mem * stats.d_std[ti] + stats.d_mean[ti],
+                mem_phys = C.precip_inv(mem * stats.d_std[ti] + stats.d_mean[ti],
                                          stats.precip_scale) * stats.precip_scale
                 mem_phys = np.where(mem_phys < stats.precip_clip, 0.0, mem_phys)
             else:
                 mem_phys = mem * stats.d_std[ti] + stats.d_mean[ti]
 
-            _, crps_px = TD.crps_ensemble(mem_phys[:, None], truth[None], land, per_pixel=True)
+            _, crps_px = MT.crps_ensemble(mem_phys[:, None], truth[None], land, per_pixel=True)
             acc[g][mo] += np.where(land, crps_px[0], 0.0).astype(np.float32)
             if is_precip:
                 mem_log = np.log1p(np.maximum(mem_phys, 0.0))
-                _, crps_lp = TD.crps_ensemble(mem_log[:, None], truth_log[None], land,
+                _, crps_lp = MT.crps_ensemble(mem_log[:, None], truth_log[None], land,
                                               per_pixel=True)
                 acc_log[g][mo] += np.where(land, crps_lp[0], 0.0).astype(np.float32)
 
@@ -231,8 +233,8 @@ def write_meta(out, a, args, ckpt_path, samples, groups, days, target):
     p = Path(ckpt_path)
     meta = {"id": out.name, "date": datetime.date.today().isoformat(),
             "kind": "jit_channel_ablation", "target": target,
-            "unit": "mm/day" if target == TD.PRECIP else "K",
-            "spaces": ["phys", "log1p(mm)"] if target == TD.PRECIP else ["phys"],
+            "unit": "mm/day" if target == C.PRECIP else "K",
+            "spaces": ["phys", "log1p(mm)"] if target == C.PRECIP else ["phys"],
             "ckpt": {"path": str(p), "bytes": p.stat().st_size, "trained_samples": samples},
             "weight": "raw" if a.ema == 0 else f"ema{a.ema}",
             "members": a.members, "steps": a.steps, "seed": a.seed,

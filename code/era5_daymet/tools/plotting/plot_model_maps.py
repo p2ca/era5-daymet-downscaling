@@ -43,12 +43,14 @@ import torch
 from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.evaluation import eval_all_methods as EAM
 from era5_daymet.training import train_corrdiff as CD
-from era5_daymet.training import train_downscale as TD
+from era5_daymet.models.unet import UNet
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
 from era5_daymet.paths import PROJECT_ROOT
 
 EXTENT = [-125.125, -65.125, 23.625, 53.625]         # 与 plot_compare.py 一致
 ASPECT = 1.0 / np.cos(np.deg2rad(0.5 * (EXTENT[2] + EXTENT[3])))   # 修正美国经纬比例(≈1.28), 替代 aspect=ASPECT
-PRECIP = TD.PRECIP
+PRECIP = C.PRECIP
 
 # 画图顺序与显示名(诊断口径, 中性)
 MODELS = ["bilinear", "bcsd", "unet", "vit", "corrdiff"]
@@ -75,14 +77,14 @@ def build(args):
     # in/out vars 以 UNet ckpt 为准(保证与 corrdiff 回归器/生成器通道一致)
     uck = os.path.join(args.unet_dir, "ckpt.pt")
     a_u = torch.load(uck, map_location="cpu").get("args", {})
-    in_vars = a_u.get("in_vars", TD.DEFAULT_IN)
-    out_vars = a_u.get("out_vars", TD.TARGETS)
+    in_vars = a_u.get("in_vars", C.DEFAULT_IN)
+    out_vars = a_u.get("out_vars", C.TARGETS)
     use_clim = a_u.get("use_clim", True)                 # 旧 ckpt 无此键=23通道; 新 ckpt 存实际值
     Cout = len(out_vars)
-    Cin = TD.cond_channels(in_vars, out_vars, use_clim)
+    Cin = C.cond_channels(in_vars, out_vars, use_clim)
 
-    stats = TD.Stats(args.stats_dir, in_vars, out_vars)
-    test = TD.DownscaleData(args.era5_dir, args.daymet_dir, [args.year],
+    stats = DS.Stats(args.stats_dir, in_vars, out_vars)
+    test = DS.DownscaleData(args.era5_dir, args.daymet_dir, [args.year],
                             in_vars, out_vars, stats, use_clim=use_clim)
 
     # --- bilinear / bcsd / unet / vit: 直接复用 eval_all_methods 的 predictors ---
@@ -96,10 +98,10 @@ def build(args):
     # --- corrdiff: 回归器 μ + 生成器 + 分块采样 ---
     gck = torch.load(os.path.join(args.corrdiff_dir, "generator.pt"), map_location=device)
     ca = gck.get("args", {})
-    regressor = TD.UNet(Cin, Cout, base=ca.get("reg_base", 64), temb=0).to(device)
+    regressor = UNet(Cin, Cout, base=ca.get("reg_base", 64), temb=0).to(device)
     regressor.load_state_dict(torch.load(args.regressor_ckpt, map_location=device)["model"])
     regressor.eval()
-    gen = TD.UNet(Cout + Cin + Cout, Cout, base=ca.get("base", 64), temb=128).to(device)
+    gen = UNet(Cout + Cin + Cout, Cout, base=ca.get("base", 64), temb=128).to(device)
     gen.load_state_dict(gck["model"])
     gen.eval()
     # ★sigma_data: args 里存的是哨兵 -1(=训练时自动估计); 真值在 ckpt 顶层。
@@ -119,7 +121,7 @@ def build(args):
     def _denorm_precip(members):                       # (N,Cout,H,W) 归一残差已加回 -> 物理
         if PRECIP in out_vars:
             pi = out_vars.index(PRECIP)
-            members[:, pi] = (TD.precip_inv(members[:, pi], stats.precip_scale)  # 默认钳 log<=8
+            members[:, pi] = (C.precip_inv(members[:, pi], stats.precip_scale)  # 默认钳 log<=8
                               if stats.precip_log else np.maximum(members[:, pi], 0.0))
         return members
 

@@ -34,6 +34,10 @@ from era5_daymet.data import downscale_baseline as DB
 from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.evaluation import eval_common as EC
 from era5_daymet.training import train_downscale as TD
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
+from era5_daymet.models.unet import UNet
+from era5_daymet.models import tiled_inference as TI
 from era5_daymet.training import train_scd as SCD
 from era5_daymet.training import train_vit as VM
 from era5_daymet.paths import PROJECT_ROOT
@@ -66,17 +70,17 @@ def _resolve_ckpt(method, args):
 def build_predictors(methods, test, stats, args, device):
     """返回 {method: fn(cond, t) -> members (N,Cout,H,W) 物理量}。"""
     y = args.test_year; out_vars = args.out_vars; Cout = len(out_vars)
-    Cin = TD.cond_channels(args.in_vars, out_vars, getattr(args, "use_clim", True))
+    Cin = C.cond_channels(args.in_vars, out_vars, getattr(args, "use_clim", True))
     dstd = stats.d_std[:, None, None]; dmean = stats.d_mean[:, None, None]
-    up_bl = DB.make_bilinear(test.Hl, test.Wl, TD.FACTOR)
-    up_bc = DB.make_bicubic(test.Hl, test.Wl, TD.FACTOR)
+    up_bl = DB.make_bilinear(test.Hl, test.Wl, C.FACTOR)
+    up_bc = DB.make_bicubic(test.Hl, test.Wl, C.FACTOR)
     preds = {}
 
     def denorm(o):                                            # (N,Cout,H,W) 归一 -> 物理
         ph = o * dstd[None] + dmean[None]
-        if TD.PRECIP in out_vars:
-            pi = out_vars.index(TD.PRECIP)
-            ph[:, pi] = (TD.precip_inv(ph[:, pi], stats.precip_scale)
+        if C.PRECIP in out_vars:
+            pi = out_vars.index(C.PRECIP)
+            ph[:, pi] = (C.precip_inv(ph[:, pi], stats.precip_scale)
                          if stats.precip_log else np.maximum(ph[:, pi], 0.0))
         return ph
 
@@ -102,7 +106,7 @@ def build_predictors(methods, test, stats, args, device):
             for v in out_vars:
                 a_, b_, sp = coefs[v]
                 x = test.lr[y][v][t].astype(np.float32)
-                if v == TD.PRECIP:                                # log1p(mm) 空间
+                if v == C.PRECIP:                                # log1p(mm) 空间
                     p = a_ * up_bl(np.log1p(np.maximum(x, 0) * 1000.0)) + b_
                     p = np.maximum(np.expm1(p), 0.0) / 1000.0     # -> m/day
                 else:                                             # 恒等空间(K)
@@ -118,7 +122,7 @@ def build_predictors(methods, test, stats, args, device):
 
         def f_unet(cond, t, _net=net_u):
             with torch.no_grad():                              # UNet 全卷积: 整帧
-                o = TD.det_predict(_net, torch.from_numpy(cond[None]).float().to(device), 0, device)[None]
+                o = TI.det_predict(_net, torch.from_numpy(cond[None]).float().to(device), 0, device)[None]
             return denorm(o)
         preds["unet"] = f_unet
 
@@ -139,18 +143,18 @@ def build_predictors(methods, test, stats, args, device):
 
         def f_vit(cond, t, _net=net_v, _tile=tile):
             with torch.no_grad():                              # ViT 位置编码绑定 patch: 分块重叠平均
-                o = TD.det_predict(_net, torch.from_numpy(cond[None]).float().to(device), _tile, device)[None]
+                o = TI.det_predict(_net, torch.from_numpy(cond[None]).float().to(device), _tile, device)[None]
             return denorm(o)
         preds["vit"] = f_vit
 
     if "scd" in methods:
         cc = os.path.join(args.scd_dir, "corrector.pt"); gc = os.path.join(args.scd_dir, "generator.pt")
         a = _load_ckpt_args(gc)
-        k = a.get("kappa_factor", TD.FACTOR); use_sigma = not a.get("no_sigma_cond", False)
-        corr = TD.UNet(Cin, 2 * Cout, base=a.get("corrector_base", 48), temb=0).to(device)
+        k = a.get("kappa_factor", C.FACTOR); use_sigma = not a.get("no_sigma_cond", False)
+        corr = UNet(Cin, 2 * Cout, base=a.get("corrector_base", 48), temb=0).to(device)
         corr.load_state_dict(torch.load(cc, map_location=device)["model"]); corr.eval()
         gen_in = Cout + Cin + Cout + (Cout if use_sigma else 0)
-        gen = TD.UNet(gen_in, Cout, base=a.get("base", 64), temb=128).to(device)
+        gen = UNet(gen_in, Cout, base=a.get("base", 64), temb=128).to(device)
         gen.load_state_dict(torch.load(gc, map_location=device)["model"]); gen.eval()
         edm = SCD.EDM(sigma_data=a.get("sigma_data", 1.0), sigma_min=a.get("sigma_min", 0.002),
                       sigma_max=a.get("sigma_max", 80.0), rho=a.get("rho", 7.0))
@@ -220,8 +224,8 @@ def run(args):
             args.use_clim = a.get("use_clim", True)       # 旧 ckpt 无此键=23通道(True); 新 ckpt 存实际值
             break
 
-    stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
-    test = TD.DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year],
+    stats = DS.Stats(args.stats_dir, args.in_vars, args.out_vars)
+    test = DS.DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year],
                             args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
     y = args.test_year; days = list(range(0, test.ndays[y], args.eval_stride))
     print(f"评测方法={methods}  test={y}  天数={len(days)}(stride={args.eval_stride})  device={device}", flush=True)
@@ -245,8 +249,8 @@ def main():
     p.add_argument("--methods", nargs="+", default=ALL, choices=ALL)
     p.add_argument("--era5-dir", default=M.ERA5_DIR); p.add_argument("--daymet-dir", default=M.DAYMET_DIR)
     p.add_argument("--stats-dir", default="stats_train")
-    p.add_argument("--in-vars", nargs="+", default=TD.DEFAULT_IN)
-    p.add_argument("--out-vars", nargs="+", default=TD.TARGETS)
+    p.add_argument("--in-vars", nargs="+", default=C.DEFAULT_IN)
+    p.add_argument("--out-vars", nargs="+", default=C.TARGETS)
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])
     p.add_argument("--unet-dir", default=str(PROJECT_ROOT / "runs/unet"), help="train_unet.py 的输出目录(找 ckpt.pt)")
     p.add_argument("--vit-dir", default=str(PROJECT_ROOT / "runs/vit"), help="train_vit.py 的输出目录(找 ckpt.pt)")
@@ -264,7 +268,7 @@ def main():
         import tempfile
         root = tempfile.mkdtemp()
         args.era5_dir, args.daymet_dir, args.stats_dir = TD.make_synth(root)
-        args.in_vars = TD.TARGETS; args.out_vars = TD.TARGETS
+        args.in_vars = C.TARGETS; args.out_vars = C.TARGETS
         args.test_year = 2020; args.eval_stride = 10; args.ensemble = 3
         args.out = root + "/cmp"
         if torch is None:

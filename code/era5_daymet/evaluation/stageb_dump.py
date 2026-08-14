@@ -52,7 +52,10 @@ from era5_daymet.evaluation import ablation_groups as AB
 from era5_daymet.models.patching import GridPatching2D
 from era5_daymet.models.preconditioning import EDMPrecondSuperResolution
 from era5_daymet.models.stochastic_sampler import stochastic_sampler
-from era5_daymet.training import train_downscale as TD
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
+from era5_daymet.evaluation import metrics as MT
+from era5_daymet.models import tiled_inference as TI
 from era5_daymet.training.stage_b_mean import pin_ocean
 
 # 采样时始终落盘的场(降水追加 crps_log)
@@ -113,7 +116,7 @@ def load_stage_a(ckpt_path, device):
     from era5_daymet.tools.plotting import plot_unet_annual_maps as PU
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ck = payload.get("args", {})
-    cin = TD.cond_channels(list(ck.get("in_vars", TD.DEFAULT_IN)), TD.TARGETS, False)
+    cin = C.cond_channels(list(ck.get("in_vars", C.DEFAULT_IN)), C.TARGETS, False)
     net = PU._build_model(ck, cin, 1, device)
     net.load_state_dict(payload["model"])
     net.eval()
@@ -123,7 +126,7 @@ def load_stage_a(ckpt_path, device):
 
 
 def fields_for(target, save_mu=False):
-    return (list(BASE_FIELDS) + (["crps_log"] if target == TD.PRECIP else [])
+    return (list(BASE_FIELDS) + (["crps_log"] if target == C.PRECIP else [])
             + (["mu"] if save_mu else []))
 
 
@@ -140,7 +143,7 @@ def write_meta(out, a, days):
         "date": datetime.date.today().isoformat(),
         "kind": "stageb_sample_dump",
         "target": a.target,
-        "unit": "mm/day" if a.target == TD.PRECIP else "K",
+        "unit": "mm/day" if a.target == C.PRECIP else "K",
         "diffusion_ckpt": file_sig(a.diffusion_ckpt),
         "stage_a_ckpt": file_sig(a.stage_a_ckpt),
         "mu_cache": a.cache,
@@ -234,7 +237,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    ti = TD.TARGETS.index(a.target)
+    ti = C.TARGETS.index(a.target)
     out = Path(a.out)
     days = resolve_days(a)
 
@@ -252,20 +255,20 @@ def main():
     if rank == 0:
         write_meta(out, a, days)
 
-    stats = TD.Stats(a.stats_dir, TD.DEFAULT_IN, TD.TARGETS)
-    d = TD.DownscaleData(M.ERA5_DIR, M.DAYMET_DIR, a.years, TD.DEFAULT_IN, TD.TARGETS, stats)
+    stats = DS.Stats(a.stats_dir, C.DEFAULT_IN, C.TARGETS)
+    d = DS.DownscaleData(M.ERA5_DIR, M.DAYMET_DIR, a.years, C.DEFAULT_IN, C.TARGETS, stats)
     H, W = d.H, d.W
 
     # 置换会改变 μ, 缓存随之失效 -> 消融(含对照)一律现算 μ; 常规 dump 仍走缓存
     slots, net_a, donor, cache = [], None, None, None
     if a.ablate:
-        slots = AB.channel_slots(AB.resolve(a.ablate), TD.DEFAULT_IN)
+        slots = AB.channel_slots(AB.resolve(a.ablate), C.DEFAULT_IN)
         net_a = load_stage_a(a.stage_a_ckpt, device)
         if a.ablate_mode == "doy":
             if a.doy_year in a.years:
                 raise ValueError(f"--doy-year {a.doy_year} 与 --years 重合, 供体必须是另一年")
-            donor = TD.DownscaleData(M.ERA5_DIR, M.DAYMET_DIR, [a.doy_year],
-                                     TD.DEFAULT_IN, TD.TARGETS, stats)
+            donor = DS.DownscaleData(M.ERA5_DIR, M.DAYMET_DIR, [a.doy_year],
+                                     C.DEFAULT_IN, C.TARGETS, stats)
     else:
         cache = MuCache(a.cache, [a.target])
         cache.verify({a.target: a.stage_a_ckpt})
@@ -281,7 +284,7 @@ def main():
     net.load_state_dict(torch.load(a.diffusion_ckpt, map_location=device)["model"])
     patching = GridPatching2D(img_shape=(H, W), patch_shape=(a.patch, a.patch),
                               overlap_pix=a.overlap, boundary_pix=a.boundary)
-    is_precip = a.target == TD.PRECIP
+    is_precip = a.target == C.PRECIP
 
     for y, day in mine:
         t0 = time.time()
@@ -297,7 +300,7 @@ def main():
         land_t = torch.from_numpy(land.astype(np.float32)[None, None]).to(device)
         if net_a is not None:                       # 在(可能已置换的)条件上现算 μ
             with torch.no_grad():
-                mu_n = TD.det_predict(net_a, cond_t, tile=0, device=device)[0]
+                mu_n = TI.det_predict(net_a, cond_t, tile=0, device=device)[0]
         else:
             mu_n = cache.get(a.target, y, day)
         mu_t = pin_ocean(torch.from_numpy(mu_n[None, None]).float().to(device), land_t)
@@ -315,7 +318,7 @@ def main():
         members_norm = np.stack(members_norm, 0)                    # (M,H,W) 归一化(log1p)空间
 
         if is_precip and stats.precip_log:
-            mem_phys = TD.precip_inv(members_norm * stats.d_std[ti] + stats.d_mean[ti],
+            mem_phys = C.precip_inv(members_norm * stats.d_std[ti] + stats.d_mean[ti],
                                      stats.precip_scale) * stats.precip_scale
             # 融合后 drizzle 截断, 与预处理同口径, 恢复零质量
             mem_phys = np.where(mem_phys < stats.precip_clip, 0.0, mem_phys)
@@ -326,7 +329,7 @@ def main():
         spread = mem_phys.std(0)
 
         # CRPS(物理): 逐像素, 陆地外置 NaN
-        _, crps_px = TD.crps_ensemble(mem_phys[:, None], truth[None], land, per_pixel=True)
+        _, crps_px = MT.crps_ensemble(mem_phys[:, None], truth[None], land, per_pixel=True)
         crps_field = np.where(land, crps_px[0], np.nan).astype(np.float32)
 
         # rank: 真值在成员中的名次, 平局按标准做法均匀劈分(种子只依赖 seed/年/日)
@@ -346,7 +349,7 @@ def main():
         if a.save_mu:                               # 阶段 A 的 μ(物理单位), 供 A/B 误差分解
             mu_phys = mu_n * stats.d_std[ti] + stats.d_mean[ti]
             if is_precip and stats.precip_log:
-                mu_phys = TD.precip_inv(mu_phys, stats.precip_scale) * stats.precip_scale
+                mu_phys = C.precip_inv(mu_phys, stats.precip_scale) * stats.precip_scale
                 mu_phys = np.where(mu_phys < stats.precip_clip, 0.0, mu_phys)
             save_field(out, "mu", y, day, np.where(land, mu_phys, np.nan).astype(np.float32))
 
@@ -354,7 +357,7 @@ def main():
             # log1p(mm) 空间 CRPS: 与功率谱一致取物理量的 log1p(max(.,0))
             mem_log = np.log1p(np.maximum(mem_phys, 0.0))
             truth_log = np.log1p(np.maximum(truth, 0.0))
-            _, crps_log_px = TD.crps_ensemble(mem_log[:, None], truth_log[None], land, per_pixel=True)
+            _, crps_log_px = MT.crps_ensemble(mem_log[:, None], truth_log[None], land, per_pixel=True)
             save_field(out, "crps_log", y, day,
                        np.where(land, crps_log_px[0], np.nan).astype(np.float32))
 

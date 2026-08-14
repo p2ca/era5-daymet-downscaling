@@ -26,13 +26,16 @@ import torch
 from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.tools.plotting import plot_model_maps as PM
 from era5_daymet.training import train_downscale as TD
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
+from era5_daymet.models import tiled_inference as TI
 from era5_daymet.evaluation import eval_common as EC
 
 
 VAR_NAMES = {
     "2m_temperature_max": "tmax",
     "2m_temperature_min": "tmin",
-    TD.PRECIP: "precip",
+    C.PRECIP: "precip",
 }
 TEMP_CMAP = plt.get_cmap("RdYlBu_r").copy()
 BIAS_CMAP = plt.get_cmap("RdBu_r").copy()
@@ -53,7 +56,7 @@ def _sha256(path: Path) -> str:
 
 
 def _display(var: str, field: np.ndarray) -> np.ndarray:
-    if var == TD.PRECIP:
+    if var == C.PRECIP:
         return np.maximum(field, 0.0) * 1000.0
     return field - 273.15
 
@@ -100,7 +103,7 @@ def _load_reference_scales(
     for i, var in enumerate(out_vars):
         truth_display = _display(var, truth_mean[i])
         valid_truth = truth_display[land]
-        if var == TD.PRECIP:
+        if var == C.PRECIP:
             field_min, field_max = 0.0, float(np.percentile(valid_truth, 99))
         else:
             field_min = float(np.percentile(valid_truth, 2))
@@ -231,19 +234,19 @@ def _load_single_target_checkpoints(paths):
         if len(ov) != 1:
             raise ValueError(f"{path}: --target-checkpoints 需要单目标 checkpoint, 实际 out_vars={ov}")
         var = ov[0]
-        if var not in TD.TARGETS:
-            raise ValueError(f"{path}: 未知目标 {var!r}, 应属于 {TD.TARGETS}")
+        if var not in C.TARGETS:
+            raise ValueError(f"{path}: 未知目标 {var!r}, 应属于 {C.TARGETS}")
         if var in loaded:
             raise ValueError(f"目标 {var!r} 提供了多个 checkpoint")
         if bool(a.get("use_clim", False)):
             raise ValueError(f"{path}: 单目标 + 气候态通道会让各目标的输入通道数不一致, 不支持拼接")
-        cur = (tuple(a.get("in_vars", TD.DEFAULT_IN)), str(a.get("stats_dir", "")))
+        cur = (tuple(a.get("in_vars", C.DEFAULT_IN)), str(a.get("stats_dir", "")))
         if contract is None:
             contract = cur
         elif cur != contract:
             raise ValueError(f"{path}: 输入变量或统计目录与其他 checkpoint 不一致, 无法拼接")
         loaded[var] = (a, payload["model"])
-    missing = [v for v in TD.TARGETS if v not in loaded]
+    missing = [v for v in C.TARGETS if v not in loaded]
     if missing:
         raise ValueError(f"缺少目标 checkpoint: {missing}")
     return loaded
@@ -302,8 +305,8 @@ def _bilinear_geometry(height: int, width: int, factor: int):
 
 
 def _full_fields_vectorized(
-    test: TD.DownscaleData,
-    stats: TD.Stats,
+    test: DS.DownscaleData,
+    stats: DS.Stats,
     out_vars: list[str],
     year: int,
     day: int,
@@ -328,9 +331,9 @@ def _full_fields_vectorized(
     dynamic += bottom * wy[None, :, None]
     dynamic = dynamic.astype(np.float32, copy=False)
 
-    if TD.PRECIP in test.in_vars and stats.precip_log:
-        precip_index = test.in_vars.index(TD.PRECIP)
-        dynamic[precip_index] = TD.precip_fwd(
+    if C.PRECIP in test.in_vars and stats.precip_log:
+        precip_index = test.in_vars.index(C.PRECIP)
+        dynamic[precip_index] = C.precip_fwd(
             dynamic[precip_index], stats.precip_clip, stats.precip_scale
         )
     dynamic = (
@@ -413,14 +416,14 @@ def _finalize_outputs(
             scale["bias_abs_max"] = (
                 float(np.percentile(np.abs(bias_display[land]), 98)) or 1.0
             )
-        field_unit = "mm/day" if var == TD.PRECIP else "°C"
-        bias_unit = "Δmm/day" if var == TD.PRECIP else "Δ°C"
+        field_unit = "mm/day" if var == C.PRECIP else "°C"
+        bias_unit = "Δmm/day" if var == C.PRECIP else "Δ°C"
         _render(
             pred_display,
             land,
             title=f"{display_name} · {args.year} annual mean",
             unit=field_unit,
-            cmap=PRECIP_CMAP if var == TD.PRECIP else TEMP_CMAP,
+            cmap=PRECIP_CMAP if var == C.PRECIP else TEMP_CMAP,
             vmin=scale["field_min"],
             vmax=scale["field_max"],
             out_path=output_dir / f"{short}_field_{tag}.png",
@@ -460,7 +463,7 @@ def _finalize_outputs(
         "physical_units": {
             "2m_temperature_max": "K (displayed as °C)",
             "2m_temperature_min": "K (displayed as °C)",
-            TD.PRECIP: "m/day (displayed as mm/day)",
+            C.PRECIP: "m/day (displayed as mm/day)",
         },
         "metrics_recomputed": result_metrics,
         "metrics_cross_check": str(Path(args.metrics).resolve()) if args.metrics else None,
@@ -532,10 +535,10 @@ def _merge_shards(args: argparse.Namespace) -> None:
     output_dir = Path(args.out).resolve()
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     ckpt_args = payload.get("args", {})
-    in_vars = list(ckpt_args.get("in_vars", TD.DEFAULT_IN))
-    out_vars = list(ckpt_args.get("out_vars", TD.TARGETS))
+    in_vars = list(ckpt_args.get("in_vars", C.DEFAULT_IN))
+    out_vars = list(ckpt_args.get("out_vars", C.TARGETS))
     use_clim = bool(ckpt_args.get("use_clim", True))
-    input_channels = TD.cond_channels(in_vars, out_vars, use_clim)
+    input_channels = C.cond_channels(in_vars, out_vars, use_clim)
 
     pred_sum = truth_sum = land = None
     metrics = _empty_metrics(out_vars)
@@ -633,22 +636,22 @@ def run(args: argparse.Namespace) -> None:
     stacked = _load_single_target_checkpoints(args.target_checkpoints) if args.target_checkpoints else None
     if stacked is not None:
         payload = None
-        ckpt_args = stacked[TD.TARGETS[0]][0]        # 三者的数据合同已校验一致
-        out_vars = list(TD.TARGETS)
+        ckpt_args = stacked[C.TARGETS[0]][0]        # 三者的数据合同已校验一致
+        out_vars = list(C.TARGETS)
     else:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         ckpt_args = payload.get("args", {})
-        out_vars = list(ckpt_args.get("out_vars", TD.TARGETS))
-        if out_vars != TD.TARGETS:
-            raise ValueError(f"expected target order {TD.TARGETS}, got {out_vars}")
-    in_vars = list(ckpt_args.get("in_vars", TD.DEFAULT_IN))
+        out_vars = list(ckpt_args.get("out_vars", C.TARGETS))
+        if out_vars != C.TARGETS:
+            raise ValueError(f"expected target order {C.TARGETS}, got {out_vars}")
+    in_vars = list(ckpt_args.get("in_vars", C.DEFAULT_IN))
     use_clim = bool(ckpt_args.get("use_clim", True))
 
     stats_dir = args.stats_dir or ckpt_args.get("stats_dir")
     era5_dir = args.era5_dir or ckpt_args.get("era5_dir") or M.ERA5_DIR
     daymet_dir = args.daymet_dir or ckpt_args.get("daymet_dir") or M.DAYMET_DIR
-    stats = TD.Stats(stats_dir, in_vars, out_vars)
-    test = TD.DownscaleData(
+    stats = DS.Stats(stats_dir, in_vars, out_vars)
+    test = DS.DownscaleData(
         era5_dir,
         daymet_dir,
         [args.year],
@@ -666,16 +669,16 @@ def run(args: argparse.Namespace) -> None:
                 f"metrics coverage={expected_days} days but dataset has {n_days} days"
             )
 
-    cin = TD.cond_channels(in_vars, out_vars, use_clim)
+    cin = C.cond_channels(in_vars, out_vars, use_clim)
     if stacked is not None:
         nets = []
-        for var in TD.TARGETS:
+        for var in C.TARGETS:
             a, state = stacked[var]
             net = _build_model(a, cin, 1, device)
             net.load_state_dict(state)
             nets.append(net)
         model = _StackedTargets(nets).to(device)
-        print(f"[u3-maps] 三个单目标 checkpoint 拼接为三通道: {TD.TARGETS}", flush=True)
+        print(f"[u3-maps] 三个单目标 checkpoint 拼接为三通道: {C.TARGETS}", flush=True)
     else:
         model = _build_model(ckpt_args, cin, len(out_vars), device)
         model.load_state_dict(payload["model"])
@@ -724,12 +727,12 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError(f"land mask changed on day index {day}")
 
         cond_tensor = torch.from_numpy(cond[None]).float().to(device)
-        normalized = TD.det_predict(model, cond_tensor, tile=0, device=device)
+        normalized = TI.det_predict(model, cond_tensor, tile=0, device=device)
         pred = normalized * dstd + dmean
-        if TD.PRECIP in out_vars:
-            precip_index = out_vars.index(TD.PRECIP)
+        if C.PRECIP in out_vars:
+            precip_index = out_vars.index(C.PRECIP)
             pred[precip_index] = (
-                TD.precip_inv(pred[precip_index], stats.precip_scale)
+                C.precip_inv(pred[precip_index], stats.precip_scale)
                 if stats.precip_log
                 else np.maximum(pred[precip_index], 0.0)
             )

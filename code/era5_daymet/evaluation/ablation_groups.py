@@ -24,8 +24,7 @@ ablation_groups.py — 条件通道的机理分组(通道敏感性实验的唯�
     固定填 1(全陆地), 即"抹掉海陆对比"。
 ============================================================================
 """
-from era5_daymet.training import train_downscale as TD
-
+from era5_daymet import contract as C
 # 静态通道的符号名(位于动态通道之后, 顺序与 DownscaleData.get_patch 拼接顺序一致)
 DZ = "dz"
 LANDCOVER = "landcover"
@@ -108,7 +107,7 @@ def resolve(name):
     if name in GROUPS:
         return list(GROUPS[name]["channels"])
     chans = [s.strip() for s in name.split(",") if s.strip()]
-    known = set(TD.DEFAULT_IN) | set(STATIC_ORDER)
+    known = set(C.DEFAULT_IN) | set(STATIC_ORDER)
     bad = [c for c in chans if c not in known]
     if bad:
         raise ValueError(f"未知通道 {bad}; 可用组 {sorted(GROUPS)} / 复合 {sorted(COMPOSITES)}")
@@ -120,7 +119,7 @@ def channel_slots(chans, in_vars=None):
 
     条件张量的通道顺序 = 动态通道(in_vars 顺序) + dz + landcover + land_sea_mask。
     """
-    in_vars = list(in_vars or TD.DEFAULT_IN)
+    in_vars = list(in_vars or C.DEFAULT_IN)
     out = []
     for c in chans:
         if c in in_vars:

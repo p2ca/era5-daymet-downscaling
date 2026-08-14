@@ -26,7 +26,8 @@ import numpy as np
 import torch
 
 from era5_daymet.models.jit_sampler import generate
-from era5_daymet.training import train_downscale as TD
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
 from era5_daymet.training.train_jit import build_model
 
 
@@ -75,10 +76,10 @@ def main():
 
     days = list(zip(args.days[0::2], args.days[1::2]))
     years = sorted({y for y, _ in days})
-    stats = TD.Stats(a["stats_dir"], TD.DEFAULT_IN, TD.TARGETS)
-    d = TD.DownscaleData(a["era5_dir"], a["daymet_dir"], years,
-                         TD.DEFAULT_IN, TD.TARGETS, stats)
-    ti = TD.TARGETS.index(a["target"])
+    stats = DS.Stats(a["stats_dir"], C.DEFAULT_IN, C.TARGETS)
+    d = DS.DownscaleData(a["era5_dir"], a["daymet_dir"], years,
+                         C.DEFAULT_IN, C.TARGETS, stats)
+    ti = C.TARGETS.index(a["target"])
 
     net = build_model(a, (d.H, d.W))
     sd = dict(ck["model"])

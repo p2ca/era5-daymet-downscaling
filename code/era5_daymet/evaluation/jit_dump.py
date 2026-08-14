@@ -37,7 +37,9 @@ import numpy as np
 import torch
 
 from era5_daymet.models.jit_sampler import generate
-from era5_daymet.training import train_downscale as TD
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
+from era5_daymet.evaluation import metrics as MT
 from era5_daymet.training.train_jit import build_model
 
 # 采样时始终落盘的场(降水追加 crps_log)
@@ -67,7 +69,7 @@ def resolve_days(a):
 
 
 def fields_for(target):
-    return list(BASE_FIELDS) + (["crps_log"] if target == TD.PRECIP else [])
+    return list(BASE_FIELDS) + (["crps_log"] if target == C.PRECIP else [])
 
 
 def file_sig(path):
@@ -84,7 +86,7 @@ def write_meta(out, a, args, ckpt_path, samples, days):
         "date": datetime.date.today().isoformat(),
         "kind": "jit_sample_dump",
         "target": target,
-        "unit": "mm/day" if target == TD.PRECIP else "K",
+        "unit": "mm/day" if target == C.PRECIP else "K",
         "diffusion_ckpt": file_sig(ckpt_path),
         "run": str(a.run),
         "weight": "raw" if a.ema == 0 else f"ema{a.ema}",
@@ -176,12 +178,12 @@ def main():
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     args = ck["args"]
     target = args["target"]
-    ti = TD.TARGETS.index(target)
-    is_precip = target == TD.PRECIP
+    ti = C.TARGETS.index(target)
+    is_precip = target == C.PRECIP
 
-    stats = TD.Stats(args["stats_dir"], TD.DEFAULT_IN, TD.TARGETS)
-    dd = TD.DownscaleData(args["era5_dir"], args["daymet_dir"], a.years,
-                          TD.DEFAULT_IN, TD.TARGETS, stats)
+    stats = DS.Stats(args["stats_dir"], C.DEFAULT_IN, C.TARGETS)
+    dd = DS.DownscaleData(args["era5_dir"], args["daymet_dir"], a.years,
+                          C.DEFAULT_IN, C.TARGETS, stats)
     H, W = dd.H, dd.W
 
     net = build_model(args, (H, W))
@@ -224,7 +226,7 @@ def main():
         members_norm = np.stack(members_norm, 0)                    # (M,H,W) 归一化(log1p)空间
 
         if is_precip and stats.precip_log:
-            mem_phys = TD.precip_inv(members_norm * stats.d_std[ti] + stats.d_mean[ti],
+            mem_phys = C.precip_inv(members_norm * stats.d_std[ti] + stats.d_mean[ti],
                                      stats.precip_scale) * stats.precip_scale
             # 融合后 drizzle 截断, 与预处理同口径, 恢复零质量
             mem_phys = np.where(mem_phys < stats.precip_clip, 0.0, mem_phys)
@@ -235,7 +237,7 @@ def main():
         spread = mem_phys.std(0)
 
         # CRPS(物理): 逐像素, 陆地外置 NaN
-        _, crps_px = TD.crps_ensemble(mem_phys[:, None], truth[None], land, per_pixel=True)
+        _, crps_px = MT.crps_ensemble(mem_phys[:, None], truth[None], land, per_pixel=True)
         crps_field = np.where(land, crps_px[0], np.nan).astype(np.float32)
 
         # rank: 真值在成员中的名次, 平局按标准做法均匀劈分(种子只依赖 seed/年/日)
@@ -256,7 +258,7 @@ def main():
             # log1p(mm) 空间 CRPS: 与功率谱一致取物理量的 log1p(max(.,0))
             mem_log = np.log1p(np.maximum(mem_phys, 0.0))
             truth_log = np.log1p(np.maximum(truth, 0.0))
-            _, crps_log_px = TD.crps_ensemble(mem_log[:, None], truth_log[None], land, per_pixel=True)
+            _, crps_log_px = MT.crps_ensemble(mem_log[:, None], truth_log[None], land, per_pixel=True)
             save_field(out, "crps_log", y, day,
                        np.where(land, crps_log_px[0], np.nan).astype(np.float32))
 

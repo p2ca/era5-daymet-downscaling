@@ -22,12 +22,12 @@ import json
 import numpy as np
 
 from era5_daymet.data import downscale_baseline as DB
-from era5_daymet.training import train_downscale as TD
-
+from era5_daymet import contract as C
+from era5_daymet.evaluation import metrics as MT
 from scipy.ndimage import binary_erosion
 from skimage.metrics import structural_similarity as _ssim
 
-PRECIP = TD.PRECIP
+PRECIP = C.PRECIP
 
 # --- SSIM 的三个口径, 定死在这里, 免得各处不一致 ---
 SSIM_SIGMA = 1.5          # Wang et al. 原始 SSIM: 11x11 高斯窗, sigma=1.5
@@ -94,7 +94,7 @@ class MultiMethodEval:
     def add_day(self, hr, mask, members_by_method):
         mb = (mask[0] if mask.ndim == 3 else mask) > 0.5
         if self.box is None:
-            self.box = TD.pick_land_box(mb, min(384, self.H, self.W))
+            self.box = MT.pick_land_box(mb, min(384, self.H, self.W))
             # ★功率谱改为★全年累加求平均★(不再只取首日快照); 首日把累加器初始化为 0
             self.spec["truth"] = {v: 0.0 for v in self.ov}
         if self.mb_er is None:
@@ -102,7 +102,7 @@ class MultiMethodEval:
         by, bx, bs = self.box; first = (self.nd == 0)
         self.tsum += hr; self.nd += 1
         for i, v in enumerate(self.ov):                          # 累加 truth 功率谱(全年平均, _plots 里除以 nd)
-            self.spec["truth"][v] = self.spec["truth"][v] + TD.radial_psd(hr[i][by:by+bs, bx:bx+bs], bs)
+            self.spec["truth"][v] = self.spec["truth"][v] + MT.radial_psd(hr[i][by:by+bs, bx:bx+bs], bs)
         pi = self.ov.index(PRECIP) if PRECIP in self.ov else None
         lg = lambda a: np.log1p(np.maximum(a, 0) * self.pscale)   # 物理量 -> log1p(mm)
         for m in self.methods:
@@ -112,7 +112,7 @@ class MultiMethodEval:
             self.msum[m] += ens
             for i, v in enumerate(self.ov):
                 self.acc[m][v].add(ens[i][mb], hr[i][mb])
-                c = TD.crps_ensemble(mem[:, i:i+1], hr[i:i+1], (mask[0] if mask.ndim == 3 else mask))[0]
+                c = MT.crps_ensemble(mem[:, i:i+1], hr[i:i+1], (mask[0] if mask.ndim == 3 else mask))[0]
                 self.crps[m][v][0] += float(c); self.crps[m][v][1] += 1
                 s = ssim_masked(ens[i], hr[i], mb, self.mb_er)   # ★SSIM 算在集合均值上(与 RMSE 同口径)
                 self.ssim[m][v][0] += s; self.ssim[m][v][1] += 1
@@ -124,12 +124,12 @@ class MultiMethodEval:
                 self.ssim_log[m][0] += s; self.ssim_log[m][1] += 1
                 self.acc_log[m].add(lg(ens[pi])[mb], lg(hr[pi])[mb])
             if mem.shape[0] > 1:
-                self.rh[m].append(TD.rank_hist(mem, hr, (mask[0] if mask.ndim == 3 else mask)))
+                self.rh[m].append(MT.rank_hist(mem, hr, (mask[0] if mask.ndim == 3 else mask)))
             if m not in self.spec:                               # 首次见到该方法 -> 初始化功率谱累加器
                 self.spec[m] = {v: {"mean": 0.0, "member": 0.0} for v in self.ov}
             for i, v in enumerate(self.ov):                      # 累加方法功率谱(全年平均)
-                self.spec[m][v]["mean"] = self.spec[m][v]["mean"] + TD.radial_psd(ens[i][by:by+bs, bx:bx+bs], bs)
-                self.spec[m][v]["member"] = self.spec[m][v]["member"] + TD.radial_psd(mem[0, i][by:by+bs, bx:bx+bs], bs)
+                self.spec[m][v]["mean"] = self.spec[m][v]["mean"] + MT.radial_psd(ens[i][by:by+bs, bx:bx+bs], bs)
+                self.spec[m][v]["member"] = self.spec[m][v]["member"] + MT.radial_psd(mem[0, i][by:by+bs, bx:bx+bs], bs)
 
     # -------------------------------------------------------------------
     def finalize(self, out_dir, test_year, eval_stride=1, tag="all", n_total_days=None,
