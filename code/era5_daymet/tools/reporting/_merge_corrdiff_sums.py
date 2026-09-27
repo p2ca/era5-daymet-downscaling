@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # Packaged implementation; the original code/ path remains compatible.
 # -*- coding: utf-8 -*-
-"""把 CorrDiff 分片评测(train_corrdiff.py --dump-sums)的累计量精确合并成规范
+"""把 CorrDiff 分片评测(已退役的简化两阶段实现 --dump-sums)的累计量精确合并成规范
 metrics_corrdiff.json。分片必须覆盖不相交的 test 天且合起来是完整 365 天。
 
   python _merge_corrdiff_sums.py --sums runs/exp/.../shard_*.pkl \

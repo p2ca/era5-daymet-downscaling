@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================================
-plot_model_maps.py — 会议用: 五模型 + truth 的地图对比 (诊断口径, 不美化)
+plot_model_maps.py — 五模型 + truth 的地图对比 (诊断口径, 不美化)
 ============================================================================
 把 bilinear / BCSD / UNet / ViT / CorrDiff 的预测与 truth 并排画出来, 用来
 ★诚实展示每个方法哪里好、哪里不好, 以及数据本身的特点与难处★
@@ -19,7 +19,7 @@ plot_model_maps.py — 会议用: 五模型 + truth 的地图对比 (诊断口�
 
 温度画成 °C; 降水两版都出: 物理 mm/day(直觉/被暴雨端主导) 与 log1p(mm)(看结构)。
 
-复用: eval_all_methods.build_predictors (bilinear/bcsd/unet/vit) + train_corrdiff 的
+复用: evaluation.predictors.build_predictors (bilinear/bcsd/unet/vit) + models.edm_diffusion 的
       回归器/生成器/分块采样。口径与归档结果文档的评测完全一致(同 ckpt 同 stats)。
 
 用法(登录节点有 GPU, 直接跑):
@@ -41,8 +41,8 @@ import matplotlib.pyplot as plt
 
 import torch
 from era5_daymet.data import match_era5_daymet as M
-from era5_daymet.evaluation import eval_all_methods as EAM
-from era5_daymet.training import train_corrdiff as CD
+from era5_daymet.evaluation import predictors as EAM
+from era5_daymet.models import edm_diffusion as ED
 from era5_daymet.models.unet import UNet
 from era5_daymet import contract as C
 from era5_daymet.data import dataset as DS
@@ -79,17 +79,16 @@ def build(args):
     a_u = torch.load(uck, map_location="cpu").get("args", {})
     in_vars = a_u.get("in_vars", C.DEFAULT_IN)
     out_vars = a_u.get("out_vars", C.TARGETS)
-    use_clim = a_u.get("use_clim", True)                 # 旧 ckpt 无此键=23通道; 新 ckpt 存实际值
     Cout = len(out_vars)
-    Cin = C.cond_channels(in_vars, out_vars, use_clim)
+    Cin = C.cond_channels(in_vars)
 
     stats = DS.Stats(args.stats_dir, in_vars, out_vars)
     test = DS.DownscaleData(args.era5_dir, args.daymet_dir, [args.year],
-                            in_vars, out_vars, stats, use_clim=use_clim)
+                            in_vars, out_vars, stats)
 
-    # --- bilinear / bcsd / unet / vit: 直接复用 eval_all_methods 的 predictors ---
+    # --- bilinear / bcsd / unet / vit: 直接复用 evaluation.predictors ---
     eam_args = SimpleNamespace(
-        test_year=args.year, out_vars=out_vars, in_vars=in_vars, use_clim=use_clim,
+        test_year=args.year, out_vars=out_vars, in_vars=in_vars,
         unet_dir=args.unet_dir, vit_dir=args.vit_dir, base_dir=str(PROJECT_ROOT / "runs/base"),
         scd_dir=str(PROJECT_ROOT / "runs/scd"), bcsd_coef_dir=args.bcsd_coef_dir, ensemble=1)
     det_preds = EAM.build_predictors(["bilinear", "bcsd", "unet", "vit"],
@@ -109,7 +108,7 @@ def build(args):
     sd_val = ca.get("sigma_data", 0)
     if not sd_val or sd_val <= 0:
         sd_val = float(gck.get("sigma_data", 1.0))
-    edm = CD.EDM(sigma_data=sd_val, sigma_min=ca.get("sigma_min", 0.002),
+    edm = ED.EDM(sigma_data=sd_val, sigma_min=ca.get("sigma_min", 0.002),
                  sigma_max=ca.get("sigma_max", 80.0), rho=ca.get("rho", 7.0))
     tile = ca.get("eval_tile", 192)
     steps = ca.get("edm_steps", 18)
@@ -134,7 +133,7 @@ def build(args):
             members = mu.cpu().numpy() * dstd[None] + dmean[None]
             return _denorm_precip(members)
         lm = torch.from_numpy((m[0] if m.ndim == 3 else m) > 0.5).to(device)
-        r = CD.tiled_sample(gen, edm, cb, mu, lm, Cout, tile, ensemble, steps, stochastic=True)
+        r = ED.tiled_sample(gen, edm, cb, mu, lm, Cout, tile, ensemble, steps, stochastic=True)
         members = (mu.cpu().numpy() + r) * dstd[None] + dmean[None]
         return _denorm_precip(members)
 

@@ -118,7 +118,7 @@ def main():
             print(f"[SP] 序列并行: sp_size={sp_size} dp_size={dp_size} (world={world}); "
                   f"单步~1/{sp_size}, 全局 batch={dp_size*args.batch}", flush=True)
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
-    Cin = TD.cond_channels(args.in_vars, args.out_vars, args.use_clim)   # 默认20通道; --use-clim=23
+    Cin = TD.cond_channels(args.in_vars)                                 # 规范口径 21 通道
     Cout = len(args.out_vars)
     model = ViT(Cin, Cout, img=args.patch, patch=args.vit_patch,
                 dim=args.dim, depth=args.depth, heads=args.heads, mlp=args.mlp,

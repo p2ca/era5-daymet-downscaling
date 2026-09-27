@@ -33,7 +33,7 @@ class ConstNet(nn.Module):
         super().__init__()
         self.c = c
 
-    def forward(self, z, t, cond):
+    def forward(self, z, t, cond, offset=(0, 0)):
         return torch.full_like(z, self.c)
 
 
@@ -45,7 +45,7 @@ class ToyNet(nn.Module):
         self.f = nn.Sequential(nn.Linear(3, 128), nn.SiLU(),
                                nn.Linear(128, 128), nn.SiLU(), nn.Linear(128, 2))
 
-    def forward(self, z, t, cond):
+    def forward(self, z, t, cond, offset=(0, 0)):
         inp = torch.cat([z.reshape(z.shape[0], 2), t.reshape(-1, 1)], dim=1)
         return self.f(inp).reshape(-1, 2, 1, 1)
 

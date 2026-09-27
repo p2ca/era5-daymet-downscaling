@@ -31,14 +31,72 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from era5_daymet.data import match_era5_daymet as M
 from era5_daymet.data.mu_cache import MuCache
 from era5_daymet.models.patching import GridPatching2D
 from era5_daymet.models.preconditioning import EDMPrecondSuperResolution
 from era5_daymet.models.stochastic_sampler import stochastic_sampler
-from era5_daymet.training import train_downscale as TD
-from era5_daymet.training.stage_b_mean import pin_ocean
+from era5_daymet import contract as C
+from era5_daymet.data import dataset as DS
+from era5_daymet.evaluation import metrics as MT
+from era5_daymet.evaluation.metrics import ssim_masked, eroded_land_mask
+from era5_daymet.training.stage_b_mean import pin_ocean, stage_b_cond_channels
+
+
+def use_mem_efficient_attention():
+    """把瓶颈自注意力切到 memory-efficient kernel。
+
+    默认的 math kernel 会显式 materialize N x N 注意力矩阵, N = (patch/4)^2, 因此显存
+    随 patch 边长的四次方增长, patch 384 在单卡上直接溢出。memory-efficient kernel 不落
+    N x N, 但要求 q/k/v 末维连续, 而网络里的 q/k/v 由 unbind 切出来是跨步视图, 故先
+    contiguous。两条路径的输出只差 fp32 舍入(相对偏差 ~1e-6)。
+    """
+    base = torch.nn.functional.scaled_dot_product_attention
+
+    def with_efficient_kernel(q, k, v, *args, **kwargs):
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+            return base(q.contiguous(), k.contiguous(), v.contiguous(), *args, **kwargs)
+
+    torch.nn.functional.scaled_dot_product_attention = with_efficient_kernel
+
+
+class PatchChunkedNet:
+    """把 patch 批切成小块逐块前向, 再拼回完整批。
+
+    网络里只有 GroupNorm 与逐样本自注意力, 没有任何跨样本统计量, 因此分块与整批在
+    数值上等价, 而峰值显存随块大小线性下降。重叠率越高块数越多(总像素约
+    H*W/(1-overlap/patch)^2), 75% 重叠时整批前向会超出单卡显存。
+
+    位置网格的切块结果只取决于 patcher 与位置网格本身, 在同一 (patch, overlap) 配置下
+    逐步恒定, 故首次算出后缓存复用: 既省掉每步重复 unfold 整张 100 通道网格的开销, 也
+    避免每个小块各留一份。缓存与配置绑定, 因此本包装体必须按配置新建。
+    """
+
+    def __init__(self, net, chunk):
+        self.net = net
+        self.chunk = int(chunk)
+        self._emb = None
+
+    def __getattr__(self, name):
+        # sigma_min / sigma_max / round_sigma 等采样器直接读的属性透传给被包装网络
+        return getattr(self.__dict__["net"], name)
+
+    def __call__(self, x, img_lr, sigma, class_labels=None, force_fp32=False, **kwargs):
+        selector = kwargs.pop("embedding_selector", None)
+        outs = []
+        for i in range(0, x.shape[0], self.chunk):
+            sl = slice(i, i + self.chunk)
+            sub = None
+            if selector is not None:
+                def sub(emb, sl=sl):
+                    if self._emb is None:
+                        self._emb = selector(emb)
+                    return self._emb[sl]
+            outs.append(self.net(x[sl], img_lr[sl], sigma, class_labels, force_fp32,
+                                 embedding_selector=sub, **kwargs))
+        return torch.cat(outs, 0)
 
 
 def to_phys(x_norm, stats, ti, target):
@@ -47,8 +105,8 @@ def to_phys(x_norm, stats, ti, target):
     < clip 的毛毛雨截回精确 0 —— 恢复被融合平均破坏的零质量, 使 member 与
     被 clip 过的真值同一约定比较。"""
     x = x_norm * stats.d_std[ti] + stats.d_mean[ti]
-    if target == TD.PRECIP and stats.precip_log:
-        x = TD.precip_inv(x, stats.precip_scale) * stats.precip_scale
+    if target == C.PRECIP and stats.precip_log:
+        x = C.precip_inv(x, stats.precip_scale) * stats.precip_scale
         x = np.where(x < stats.precip_clip, 0.0, x)
     return x
 
@@ -150,16 +208,26 @@ def main():
     p.add_argument("--model-channels", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--figs", type=int, default=0, help="1=每个 (配置,日) 出六联图")
+    p.add_argument("--sdpa-mem-efficient", type=int, default=0,
+                   help="1=瓶颈自注意力强制走 memory-efficient kernel。默认的 math kernel 会显式"
+                        "materialize N x N 注意力矩阵, N=(patch/4)^2, 显存随 patch 四次方增长; "
+                        "大 patch 必须开。两者输出仅差 fp32 舍入(相对 1e-6)")
+    p.add_argument("--patch-chunk", type=int, default=0,
+                   help="每次网络前向最多送入多少个 patch(0=一次送完整批)。高重叠率下块数是"
+                        "低重叠率的数倍, 整批前向会超显存; 分块与整批数值等价")
     p.add_argument("--merge-only", action="store_true", help="只汇总 parts/, 不采样")
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
-    ti = TD.TARGETS.index(args.target)
-    unit = "mm/day" if args.target == TD.PRECIP else "K"
+    ti = C.TARGETS.index(args.target)
+    unit = "mm/day" if args.target == C.PRECIP else "K"
     out = Path(args.out)
     if args.merge_only:
         merge(out, args.target, unit)
         return
+
+    if args.sdpa_mem_efficient:
+        use_mem_efficient_attention()
 
     rank = int(os.environ.get("SLURM_PROCID", "0"))
     ntasks = int(os.environ.get("SLURM_NTASKS", "1"))
@@ -172,8 +240,8 @@ def main():
 
     cache = MuCache(args.cache, [args.target])
     cache.verify({args.target: args.stage_a_ckpt})
-    stats = TD.Stats(args.stats_dir, TD.DEFAULT_IN, TD.TARGETS)
-    d = TD.DownscaleData(M.ERA5_DIR, M.DAYMET_DIR, years, TD.DEFAULT_IN, TD.TARGETS, stats)
+    stats = DS.Stats(args.stats_dir, C.DEFAULT_IN, C.TARGETS)
+    d = DS.DownscaleData(M.ERA5_DIR, M.DAYMET_DIR, years, C.DEFAULT_IN, C.TARGETS, stats)
     H, W = d.H, d.W
 
     mine = assign_rank(combos, ntasks, args.patch, H, W)[rank]
@@ -183,7 +251,7 @@ def main():
           f"{[(f'ov{o}bd{b}', f'{y}-d{dd}') for o, b, y, dd in mine]}", flush=True)
 
     net = EDMPrecondSuperResolution(
-        img_resolution=[H, W], img_in_channels=41 + 100, img_out_channels=1,
+        img_resolution=[H, W], img_in_channels=stage_b_cond_channels(n_grid=100), img_out_channels=1,
         model_type="SongUNetPosEmbd", model_channels=args.model_channels,
         channel_mult=[1, 2, 2], attn_resolutions=[16],
         N_grid_channels=100, gridtype="learnable",
@@ -198,7 +266,7 @@ def main():
             cond, tgt, mask, hr = d.full(y, day)
             land = mask[0] > 0.5
             truth = hr[ti].astype(np.float64)
-            if args.target == TD.PRECIP:
+            if args.target == C.PRECIP:
                 truth = truth * stats.precip_scale        # 真值 m/day -> mm/day
             truth_norm = tgt[ti].astype(np.float32)       # 归一化空间真值(扩散工作空间)
             cond_t = torch.from_numpy(cond[None]).float().to(device)
@@ -210,6 +278,8 @@ def main():
 
         patching = GridPatching2D(img_shape=(H, W), patch_shape=(args.patch, args.patch),
                                   overlap_pix=ov, boundary_pix=bd)
+        # 位置网格缓存与切块配置绑定, 每个工作项新建一个包装体
+        sampler_net = PatchChunkedNet(net, args.patch_chunk) if args.patch_chunk else net
         members_norm = []
         for m in range(args.members):
             # 种子只含 (年,日,member): 配置间共享潜变量, 成对可比
@@ -217,7 +287,7 @@ def main():
             lat = torch.randn(1, 1, H, W, device=device)
             with torch.no_grad():
                 r = stochastic_sampler(
-                    net=net, latents=lat, img_lr=cond_t, patching=patching,
+                    net=sampler_net, latents=lat, img_lr=cond_t, patching=patching,
                     mean_hr=mu_t, num_steps=args.steps, sigma_min=args.sigma_min,
                     sigma_max=args.sigma_max, rho=7, S_churn=0, S_noise=1)
             members_norm.append(mu_t[0, 0].cpu().numpy() + r[0, 0].float().cpu().numpy())
@@ -231,6 +301,11 @@ def main():
 
         rmse_members = [masked_rmse(mem_phys[m], truth, land) for m in range(args.members)]
         mae_members = [masked_mae(mem_phys[m], truth, land) for m in range(args.members)]
+        # 单成员 vs 集合均值的锐度与 SSIM: 判定"均值偏平滑"是模型缺陷还是指标口径问题
+        _er = eroded_land_mask(land)
+        _rough = lambda f: float(np.nanstd(np.diff(np.where(land, f, np.nan), axis=-1)))
+        ssim_members = [ssim_masked(mem_phys[m], truth, land, _er) for m in range(args.members)]
+        rough_members = [_rough(mem_phys[m]) for m in range(args.members)]
         met = {
             "config": f"ov{ov}_bd{bd}", "year": y, "day": day,
             "rmse_mu": masked_rmse(mu_phys, truth, land),
@@ -240,7 +315,14 @@ def main():
             "rmse_member_avg": float(np.mean(rmse_members)),
             "rmse_members": [round(v, 5) for v in rmse_members],
             "mae_members": [round(v, 5) for v in mae_members],
-            "crps_ens": TD.crps_ensemble(mem_phys[:, None], truth[None], land)[0],
+            "crps_ens": MT.crps_ensemble(mem_phys[:, None], truth[None], land)[0],
+            "ssim_ens_mean": float(ssim_masked(ens_mean, truth, land, _er)),
+            "ssim_member_avg": float(np.mean(ssim_members)),
+            "ssim_mu": float(ssim_masked(mu_phys, truth, land, _er)),
+            "rough_truth": _rough(truth),
+            "rough_ens_mean": _rough(ens_mean),
+            "rough_member_avg": float(np.mean(rough_members)),
+            "rough_mu": _rough(mu_phys),
             "spread_land_mean": float(spread[land].mean()),
             "residual_std_land": float(r_one[land].std()),
             "ens_shift_from_mu": masked_mae(ens_mean, mu_phys, land),
@@ -256,7 +338,7 @@ def main():
         fields = dict(truth=truth.astype(np.float32), mu=mu_phys.astype(np.float32),
                       ens_mean=ens_mean.astype(np.float32), spread=spread.astype(np.float32),
                       r_one=r_one.astype(np.float32), land=land)
-        if args.target == TD.PRECIP:
+        if args.target == C.PRECIP:
             # 降水补归一化(log)空间字段与湿区量: 物理场经 expm1 不可逆推, 须单独落盘
             mu_norm = mu_t[0, 0].cpu().numpy().astype(np.float32)
             fields.update(truth_norm=truth_norm, mu_norm=mu_norm,
@@ -265,7 +347,7 @@ def main():
                           wet_prob=(mem_phys >= 0.1).mean(0).astype(np.float32))
             # expm1 钳制比例(红旗诊断): 反归一化后 log 值超上界的像素占比
             logs = members_norm * stats.d_std[ti] + stats.d_mean[ti]
-            met["clip_frac"] = float((logs > TD.PRECIP_LOG_MAX).mean())
+            met["clip_frac"] = float((logs > C.PRECIP_LOG_MAX).mean())
         np.savez_compressed(out / "fields" / f"ens_fields_{args.target}_{y}_d{day}_ov{ov}bd{bd}.npz",
                             **fields)
 

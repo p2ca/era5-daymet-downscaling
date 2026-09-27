@@ -14,6 +14,28 @@ GroupNorm 的统计量与卷积边界都会变, 实测偏差可达阶段 A 自�
 """
 import torch
 
+from era5_daymet.contract import DEFAULT_IN, TIME_ORDER, cond_channels
+
+
+def stage_b_cond_channels(in_vars=None, n_target=1, n_grid=0, n_constant=None):
+    """阶段 B 扩散网的条件通道数, 即 EDMPrecondSuperResolution 的 img_in_channels。
+
+    官方 ResidualLoss 在 hr_mean_conditioning=True 且启用 patching 时, 条件由三段拼成:
+
+        μ(n_target) + 本 patch 的条件切片(C_lr) + 整幅条件插值到 patch 尺寸的副本
+
+    第三段的用途是让每个 patch 都保有全域信息, 因此末尾 n_constant 个**空间常数**通道
+    不进入它 —— 常数场的全域信息在每个 patch 自己那份里已经完整存在, 副本贡献恒为零
+    (默认取数据合同的 TIME_ORDER 长度; 传 0 复现上游行为)。
+    SongUNetPosEmbd 随后在网络内部再追加 n_grid 个位置嵌入通道, 因此一并计入。
+
+    这个数只在此处算一次: 训练、采样、诊断与测试都靠它构网, 任意两处对不上, 权重就装不
+    回去; 一旦散成字面量, 改动条件通道口径必然漏改其中几处。
+    """
+    c_lr = cond_channels(DEFAULT_IN if in_vars is None else in_vars)
+    n_const = len(TIME_ORDER) if n_constant is None else int(n_constant)
+    return n_target + c_lr + (c_lr - n_const) + n_grid
+
 
 class CachedRegressionMean(torch.nn.Module):
     """伪装成阶段 A 回归网, 返回本步预取的全域 μ。

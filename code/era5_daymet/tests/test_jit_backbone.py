@@ -52,8 +52,12 @@ def main():
     check("输出形状 (B,1,H,W)", out.shape == (2, 1, 24, 32))
     check("零初始化: 初始 x 预测恒为 0", bool((out == 0).all()))
 
-    img = torch.randn(2, 1, 24, 32)
-    p, ghh, gww = 4, 6, 8
+    # unpatchify 作用在补边后的切块网格上(随机起点要求网格能容下任意起点), 故用模型
+    # 自报的 grid_hw 构造对拍张量, 而不是原始 24x32。
+    p, ghh, gww = net.patch, net.x_embedder.gh, net.x_embedder.gw
+    check("切块网格已补到可容纳任意起点",
+          net.grid_hw == (ghh * p, gww * p) and ghh * p >= 24 + p - 1)
+    img = torch.randn(2, 1, ghh * p, gww * p)
     pat = img.reshape(2, 1, ghh, p, gww, p)
     pat = torch.einsum("nchpwq->nhwpqc", pat).reshape(2, ghh * gww, p * p * 1)
     check("unpatchify 与 patchify 互逆", torch.allclose(net.unpatchify(pat), img))

@@ -14,7 +14,7 @@ preconditioning.py — EDM 超分辨率预条件包装(阶段 B 用)
 按名反射取骨干类改为在本模块全局表中查找。
 ============================================================================
 """
-from typing import List, Literal, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -137,6 +137,8 @@ class EDMPrecondSuperResolution(torch.nn.Module):
             out_channels=img_out_channels,
             **model_kwargs,
         )  # TODO needs better handling
+        # 与同族的 EDMPrecond 等保持一致: 记下向量条件的维度, 供 forward 归一 class_labels。
+        self.label_dim = int(model_kwargs.get("label_dim", 0) or 0)
         self.scaling_fn = self._scaling_fn
         self.use_fp16 = use_fp16
 
@@ -219,6 +221,7 @@ class EDMPrecondSuperResolution(torch.nn.Module):
         x: torch.Tensor,
         img_lr: torch.Tensor,
         sigma: torch.Tensor,
+        class_labels: Optional[torch.Tensor] = None,
         force_fp32: bool = False,
         **model_kwargs: dict,
     ) -> torch.Tensor:
@@ -255,6 +258,17 @@ class EDMPrecondSuperResolution(torch.nn.Module):
         ValueError
             If the model output dtype doesn't match the expected dtype.
         """
+        # class_labels 必须排在 force_fp32 之前: 采样器按
+        # net(x, x_lr, t_hat, class_labels, ...) 的约定传第 4 个位置参数, 而同族其它
+        # precond 类也都是这个次序。原实现此处缺 class_labels, 于是标签张量会落进
+        # force_fp32 —— 恒为 None 时碰巧无害, 一旦真传标签就静默强制 fp32 且标签丢失。
+        class_labels = (
+            None
+            if self.label_dim == 0
+            else torch.zeros([1, self.label_dim], device=x.device)
+            if class_labels is None
+            else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        )
         # Concatenate input channels
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
@@ -278,7 +292,7 @@ class EDMPrecondSuperResolution(torch.nn.Module):
         F_x = self.model(
             arg,
             c_noise.flatten(),
-            class_labels=None,
+            class_labels=class_labels,
             **model_kwargs,
         )
 

@@ -4,8 +4,9 @@
 ============================================================================
 jit_ablation.py — JiT 整幅扩散的通道敏感性实验, 逐像素逐月落盘
 ============================================================================
-按机理分组置换条件通道后重新采样, 看逐像素 CRPS 怎么变。ΔCRPS = crps_month(组)
-− crps_month(none), 逐像素逐月, 任何按分区/季节的聚合都是它的函数, 与本脚本解耦。
+置换条件通道后重新采样, 看逐像素 CRPS 怎么变; 缺省 = 逐通道消融。
+ΔCRPS = crps_month(组) − crps_month(none), 逐像素逐月, 任何按分区/季节的聚合都是它的
+函数, 与本脚本解耦。
 
 JiT 是单阶段模型, 没有确定性的均值分支可借, 所以每个分组每天都要重采一遍完整集合。
 让这件事仍然可行的是**配对种子**: 成员种子只依赖 (seed, 年, 日, 成员), 与是否置换无关,
@@ -56,8 +57,11 @@ def main():
     ap.add_argument("--months", type=int, nargs="+", default=None,
                     help="只算这些月份; 缺省全年。采样始终全域整幅, 不裁区域")
     ap.add_argument("--groups", nargs="+", default=None,
-                    help=f"缺省 = none + 全部八组 + 三个复合; 可选 {sorted(AB.GROUPS)} "
-                         f"{sorted(AB.COMPOSITES)}")
+                    help=f"只跑给定的组(机理组/复合/通道名); 缺省 = none + 逐通道; "
+                         f"可选 {sorted(AB.GROUPS)} {sorted(AB.COMPOSITES)}")
+    ap.add_argument("--per-channel", action="store_true",
+                    help="逐通道消融(合同里每个通道自成一组 + none), 即缺省行为的显式写法; "
+                         "与 --groups 互斥。回答边际贡献, 与分组消融的机理贡献不可换算")
     ap.add_argument("--ablate-mode", choices=["zero", "doy"], default="zero")
     ap.add_argument("--doy-year", type=int, default=2019)
     ap.add_argument("--finalize", action="store_true",
@@ -66,7 +70,13 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    groups = a.groups or ([AB.NONE] + list(AB.GROUPS) + list(AB.COMPOSITES))
+    if a.per_channel and a.groups:
+        raise SystemExit("--per-channel 与 --groups 互斥")
+    if a.groups:
+        groups = a.groups
+    else:
+        # 缺省 = 逐通道消融(与 --per-channel 相同); 机理组/复合用 --groups 显式选取
+        groups = [AB.NONE] + AB.per_channel()
     if AB.NONE not in groups:
         groups = [AB.NONE] + groups          # 基线必须有, 否则 ΔCRPS 无从谈起
     out = Path(a.out)

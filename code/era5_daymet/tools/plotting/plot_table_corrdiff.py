@@ -22,14 +22,11 @@ import os
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 
-FONT = os.path.expanduser("~/.fonts/NotoSansSC-Regular.otf")
-if os.path.exists(FONT):
-    fm.fontManager.addfont(FONT)
-    plt.rcParams["font.family"] = fm.FontProperties(fname=FONT).get_name()
-plt.rcParams["axes.unicode_minus"] = False
+from era5_daymet.tools.plotting.mpl_style import use_cjk
+
+use_cjk()
 
 INK, INK2, MUTED, RULE, BG = "#0b0b0b", "#52514e", "#8a8880", "#d8d7d0", "#ffffff"
 HL = "#e8f2fd"

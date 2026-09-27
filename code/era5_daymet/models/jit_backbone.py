@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from era5_daymet.models.moe_ffn import DSMoE
+from era5_daymet.contract import DEFAULT_IN, cond_channels
 from era5_daymet.models.vit import get_2d_sincos_pos_embed
 
 
@@ -171,15 +172,38 @@ class JiTBlock(nn.Module):
         return x
 
 
-class BottleneckPatchEmbed(nn.Module):
-    """patch 嵌入的低秩重参数化: p x p 卷积(无 bias)压到 bottleneck 维, 1x1 升到 hidden。"""
+def draw_patch_offset(patch, device, generator=None):
+    """抽切块网格的起点 (dy, dx) ∈ [0, patch)²。
 
-    def __init__(self, hw, patch, in_ch, bottleneck, hidden, bias=True):
+    必须从调用方给定的随机流里抽, 而不是全局流: 训练时它与 (t, 噪声) 共用那条随断点
+    入盘的专属流, 续训才逐位连续; 验证时它来自逐批固定种子的临时流, 起点因而逐 epoch
+    固定, val 数值跨 epoch 可比。
+    """
+    if not patch or patch <= 1:
+        return (0, 0)
+    r = torch.randint(0, int(patch), (2,), device=device, generator=generator)
+    return (int(r[0]), int(r[1]))
+
+
+class BottleneckPatchEmbed(nn.Module):
+    """patch 嵌入的低秩重参数化: 卷积(无 bias)压到 bottleneck 维, 1x1 升到 hidden。
+
+    margin > 0 时卷积核放大到 patch + 2*margin 而**步长仍为 patch**: 每块的*读取*窗口
+    与邻居重叠 margin 像素, 但*写出*范围不变(仍是自己那 patch x patch)。因此块数、拼接
+    方式与输出形状全都不变, 也不需要任何融合权重 —— 没有两块画到同一像素上。
+    padding=margin 恰好抵消核变大带来的尺寸缩水, 用反射而非补零, 免得在域边引入人造零值。
+
+    不重叠时每块只看得见自己那一格, 相邻两块在共享边界上无从对齐; 重叠让它们看到彼此。
+    """
+
+    def __init__(self, hw, patch, in_ch, bottleneck, hidden, bias=True, margin=0):
         super().__init__()
         H, W = hw
         assert H % patch == 0 and W % patch == 0, f"{hw} 不可被 patch={patch} 整除"
         self.gh, self.gw = H // patch, W // patch
-        self.proj1 = nn.Conv2d(in_ch, bottleneck, patch, stride=patch, bias=False)
+        self.margin = int(margin)
+        self.proj1 = nn.Conv2d(in_ch, bottleneck, patch + 2 * self.margin, stride=patch,
+                               padding=self.margin, padding_mode="reflect", bias=False)
         self.proj2 = nn.Conv2d(bottleneck, hidden, 1, bias=bias)
 
     def forward(self, x):
@@ -208,15 +232,20 @@ class JiT(nn.Module):
                 (True: 奇数索引块; False: 全部块)。
     """
 
-    def __init__(self, hw=(720, 1440), patch=16, cond_ch=20, out_ch=1,
+    def __init__(self, hw=(720, 1440), patch=32, cond_ch=cond_channels(DEFAULT_IN), out_ch=1,
                  hidden=384, depth=12, num_heads=6, mlp_ratio=4.0,
-                 bottleneck=128, attn_drop=0.0, proj_drop=0.0, moe_config=None):
+                 bottleneck=128, attn_drop=0.0, proj_drop=0.0, moe_config=None,
+                 patch_margin=0):
         super().__init__()
         self.hw, self.patch, self.out_ch = tuple(hw), patch, out_ch
         self.hidden, self.depth = hidden, depth
+        # 切块网格补到"不小于 H+patch-1 的最小可整除尺寸": 这样任意起点 (dy,dx)∈[0,patch)²
+        # 都放得下, 且**形状恒定** —— 位置编码与 RoPE 是按固定网格预生成的, 形状一变就得重建。
+        self.grid_hw = (-(-(self.hw[0] + patch - 1) // patch) * patch,
+                        -(-(self.hw[1] + patch - 1) // patch) * patch)
         self.t_embedder = TimestepEmbedder(hidden)
-        self.x_embedder = BottleneckPatchEmbed(hw, patch, cond_ch + out_ch,
-                                               bottleneck, hidden)
+        self.x_embedder = BottleneckPatchEmbed(self.grid_hw, patch, cond_ch + out_ch,
+                                               bottleneck, hidden, margin=patch_margin)
         gh, gw = self.x_embedder.gh, self.x_embedder.gw
         self.register_buffer("pos_embed",
                              get_2d_sincos_pos_embed(hidden, gh, gw).float(),
@@ -266,14 +295,25 @@ class JiT(nn.Module):
         x = torch.einsum("nhwpqc->nchpwq", x)
         return x.reshape(B, c, gh * p, gw * p)
 
-    def forward(self, z, t, cond):
+    def forward(self, z, t, cond, offset=(0, 0)):
+        """offset=(dy,dx) 是切块网格的起点, 取值 [0,patch)。
+
+        固定起点时同一个像素永远落在块内同一位置, 而逐像素损失从不惩罚"相邻块在边界上
+        对不上", 于是接缝是免费的, 会在固定位置累积成网格。每步换起点后, 同一像素这次
+        在边界、下次在块内, 任何位置特异的偏置在平均意义上都要挨罚 —— 接缝因此变得有代价。
+        """
+        H, W = self.hw
+        Hp, Wp = self.grid_hw
+        dy, dx = int(offset[0]) % self.patch, int(offset[1]) % self.patch
         x = torch.cat([z, cond], dim=1)
+        x = F.pad(x, (dx, Wp - W - dx, dy, Hp - H - dy), mode="reflect")
         x = self.x_embedder(x)
         x = x + self.pos_embed.to(x.dtype)
         c = self.t_embedder(t)
         for blk in self.blocks:
             x = blk(x, c, self.rope)
-        return self.unpatchify(self.final_layer(x, c))
+        out = self.unpatchify(self.final_layer(x, c))
+        return out[..., dy:dy + H, dx:dx + W]
 
     def moe_layers(self):
         return [m for m in self.modules() if isinstance(m, DSMoE)]

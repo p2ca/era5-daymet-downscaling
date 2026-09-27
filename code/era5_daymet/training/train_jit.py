@@ -4,7 +4,7 @@
 ============================================================================
 train_jit.py — 整幅像素空间条件扩散 (JiT / JiTMoE)
 ============================================================================
-单目标条件生成 p(y | 20 通道条件场): 不做残差分解、不依赖回归均值模型, 整幅
+单目标条件生成 p(y | 21 通道条件场): 不做残差分解、不依赖回归均值模型, 整幅
 720x1440 直接训练。范式与超参遵循 JiT (arXiv:2511.13720):
 
   z = t*y + (1-t)*noise_scale*e,  t ~ sigmoid(N(P_mean, P_std^2)),  t=1 为数据端
@@ -13,8 +13,9 @@ train_jit.py — 整幅像素空间条件扩散 (JiT / JiTMoE)
 口径约定:
   - 目标场在海洋置 0 后参与加噪(z 的统计处处良定), 损失默认只在陆地归一化;
     采样侧配合把每步 x 预测的海洋区钳 0(见 models/jit_sampler.py)。
-  - lr = blr * 全局批 / 256(线性缩放), 逐步线性 warmup 后恒定; AdamW(0.9, 0.95),
-    无权重衰减, 无梯度裁剪(--grad-clip 默认 1e6 仅作范数监控)。
+  - lr 全程不衰减: --lr 给绝对值, 否则按 blr * 全局批 / 256 线性缩放;
+    --warmup-samples > 0 时先逐步线性升到该值, 为 0 则从第一步起就是目标值。
+    AdamW(0.9, 0.95), 无权重衰减, 无梯度裁剪(--grad-clip 默认 1e6 仅作范数监控)。
   - 每步维护两份参数 EMA(采样默认用 ema1)。EMA 只覆盖参数; MoE 路由偏置是 buffer,
     随 model state 保存, 导出 EMA 权重采样时由加载方从 model state 取 buffer。
   - 取帧为全局序号决定的无放回洗牌流(与其余整幅训练一致), 断点续训逐帧精确;
@@ -38,7 +39,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from era5_daymet.data import match_era5_daymet as M
-from era5_daymet.models.jit_backbone import JiT
+from era5_daymet.models.jit_backbone import JiT, draw_patch_offset
 from era5_daymet.training import train_downscale as TD
 
 
@@ -86,7 +87,8 @@ class JitFrameStream(torch.utils.data.Dataset):
                 torch.from_numpy(land))
 
 
-def jit_vloss(net, tgt, cond, weight, noise_scale, p_mean, p_std, t_eps, generator=None):
+def jit_vloss(net, tgt, cond, weight, noise_scale, p_mean, p_std, t_eps, generator=None,
+              patch=None):
     """JiT 训练损失。恒等式 (v - v_pred) = (y - x_hat)/(1-t) 使 v 差可由 x 差直接算出。
     t 与噪声取自 generator(训练用专属流并随断点入盘 -> 续训逐位连续, 且不受其他库
     消耗全局随机流的影响; 验证用逐批固定种子的临时流)。"""
@@ -97,7 +99,8 @@ def jit_vloss(net, tgt, cond, weight, noise_scale, p_mean, p_std, t_eps, generat
     e = torch.randn(tgt.shape, device=tgt.device, dtype=tgt.dtype,
                     generator=generator) * noise_scale
     z = tb * tgt + (1.0 - tb) * e
-    x_hat = net(z, t, cond)
+    off = draw_patch_offset(patch, tgt.device, generator)   # 切块起点与 (t,噪声) 同流
+    x_hat = net(z, t, cond, offset=off)
     diff = (tgt - x_hat.float()) / (1.0 - tb).clamp_min(t_eps)
     return (diff.square() * weight).sum() / weight.sum().clamp_min(1.0)
 
@@ -187,10 +190,25 @@ def build_model(a, hw):
             "proj_drop": a["proj_dropout"],
         }
     return JiT(hw=hw, patch=a["patch"], cond_ch=a["cond_ch"], out_ch=1,
+               patch_margin=a.get("patch_margin", 0),
                hidden=a["hidden"], depth=a["depth"], num_heads=a["heads"],
                mlp_ratio=a["mlp_ratio"], bottleneck=a["bottleneck"],
                attn_drop=a["attn_dropout"], proj_drop=a["proj_dropout"],
                moe_config=moe_config)
+
+
+# 续训时必须与 checkpoint 逐项一致的参数。noise_scale / lr / batch 一类标量不改变
+# 任何参数形状, 在续训段写错只会静默换口径; 预算类参数(duration / max_seconds)不在此列。
+RESUME_PINNED_ARGS = (
+    "target", "stats_dir", "era5_dir", "daymet_dir", "train_years", "val_years",
+    "cond_ch", "hidden", "depth", "heads", "patch", "patch_margin", "bottleneck",
+    "mlp_ratio", "attn_dropout", "proj_dropout",
+    "moe", "experts", "experts_per_tok", "moe_intermediate", "routed_scaling",
+    "moe_all_layers", "moe_no_shared", "bias_gamma",
+    "p_mean", "p_std", "noise_scale", "t_eps",
+    "lr", "blr", "warmup_samples", "wd", "ema1", "ema2", "batch", "grad_clip",
+    "seed", "save_rng", "loss_scope", "val_steps",
+)
 
 
 def main(argv=None, data=None):
@@ -202,12 +220,16 @@ def main(argv=None, data=None):
     p.add_argument("--daymet-dir", default=M.DAYMET_DIR)
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["train"])
     p.add_argument("--val-years", type=int, nargs="+", default=M.splits["val"])
-    p.add_argument("--cond-ch", type=int, default=20)
+    p.add_argument("--cond-ch", type=int, default=TD.cond_channels(TD.DEFAULT_IN),
+                   help="条件通道数; 默认取数据合同, 只有合成数据自测才需要覆盖")
     # 结构
     p.add_argument("--hidden", type=int, default=384)
     p.add_argument("--depth", type=int, default=12)
     p.add_argument("--heads", type=int, default=6)
-    p.add_argument("--patch", type=int, default=16)
+    p.add_argument("--patch", type=int, default=32,
+                   help="切块边长; 网格会补到不小于 H+patch-1 的最小可整除尺寸, 故不要求整除")
+    p.add_argument("--patch-margin", type=int, default=8,
+                   help="每块向四周多读的像素数(重叠只在读、不在写); 0 为不重叠")
     p.add_argument("--bottleneck", type=int, default=128)
     p.add_argument("--mlp-ratio", type=float, default=4.0)
     p.add_argument("--attn-dropout", type=float, default=0.0)
@@ -287,15 +309,23 @@ def main(argv=None, data=None):
         print(f"[jit] target={args.target} 参数 {pc['total']:,} "
               f"(激活 {pc['activated']:,} / 路由专家 {pc['routed_experts']:,}) "
               f"token {gh}x{gw}={gh*gw} world={world} batch/rank={args.batch}", flush=True)
-        print(f"[jit] lr={lr:.2e} (blr={args.blr:.1e} x {global_batch}/256) "
+        how = ("显式给定" if args.lr > 0
+               else f"blr {args.blr:.1e} x 全局批 {global_batch}/256")
+        ramp = (f"warmup {args.warmup_samples:,} samples 后恒定"
+                if args.warmup_samples > 0 else "全程恒定, 无 warmup")
+        print(f"[jit] lr={lr:.2e} ({how}; {ramp}) "
               f"noise_scale={args.noise_scale} P_mean={args.p_mean} moe={args.moe} "
               f"duration={args.duration:,} samples", flush=True)
 
     per_step = global_batch
     steps_total = args.duration // per_step
     ck = None
-    if args.resume and Path(args.resume).exists():
+    if args.resume:
+        if not Path(args.resume).exists():
+            raise SystemExit(f"--resume 指定的断点不存在: {args.resume}")
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        TD.check_resume_args(ck, args, RESUME_PINNED_ARGS, world=world,
+                             path_keys=("stats_dir", "era5_dir", "daymet_dir"))
     done_steps = (ck["samples"] // per_step) if ck else 0
     if done_steps >= steps_total:
         raise SystemExit(f"断点已达 {ck['samples']:,} samples >= duration {args.duration:,}")
@@ -345,7 +375,8 @@ def main(argv=None, data=None):
         w = land if args.loss_scope == "land" else torch.ones_like(land)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device != "cpu")):
             return jit_vloss(model, tgt, cond, w, args.noise_scale,
-                             args.p_mean, args.p_std, args.t_eps, generator=g)
+                             args.p_mean, args.p_std, args.t_eps, generator=g,
+                             patch=args.patch)
 
     seen, t0, hist = done_steps * per_step, time.time(), []
     best = float("inf")
@@ -369,8 +400,16 @@ def main(argv=None, data=None):
             g["lr"] = cur_lr
         loss = run_batch(cond, tgt, land, gen)
         lv = float(loss.detach())
-        if not math.isfinite(lv):
-            raise SystemExit(f"[jit] rank{rank} 损失非有限 ({lv}) @ {seen:,} samples")
+        # 非有限损失必须全 rank 一起判定。只让触发的那个 rank 退出的话, 其余 rank 会一直
+        # 等在下一次集合通信上, 直到 NCCL 看门狗超时才连带杀掉作业 —— 整个机时白烧, 而
+        # 日志里只留一句超时, 真正的原因要翻遍全部 rank 的 stderr 才找得到。
+        nonfinite = torch.tensor([0.0 if math.isfinite(lv) else 1.0], device=device)
+        if is_dist:
+            dist.all_reduce(nonfinite)
+        n_bad = int(nonfinite.item())
+        if n_bad:
+            raise SystemExit(f"[jit] 损失非有限: {n_bad}/{world} 个 rank 触发 "
+                             f"(本 rank {lv}) @ {seen:,} samples")
         opt.zero_grad()
         loss.backward()
         if step == 1 and is_dist:

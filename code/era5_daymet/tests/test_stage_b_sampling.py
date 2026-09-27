@@ -23,7 +23,7 @@ from era5_daymet.models.patching import GridPatching2D
 from era5_daymet.models.preconditioning import EDMPrecondSuperResolution
 from era5_daymet.models.stochastic_sampler import stochastic_sampler
 from era5_daymet.training import train_downscale as TD
-from era5_daymet.training.stage_b_mean import pin_ocean
+from era5_daymet.training.stage_b_mean import pin_ocean, stage_b_cond_channels
 
 
 def seam_ratio(field, land, patch, overlap, axis):
@@ -84,7 +84,7 @@ def main():
                      .float().to(device), land_t)
 
     net = EDMPrecondSuperResolution(
-        img_resolution=[H, W], img_in_channels=41 + 100, img_out_channels=1,
+        img_resolution=[H, W], img_in_channels=stage_b_cond_channels(n_grid=100), img_out_channels=1,
         model_type="SongUNetPosEmbd", model_channels=args.model_channels,
         channel_mult=[1, 2, 2], attn_resolutions=[16],
         N_grid_channels=100, gridtype="learnable", sigma_data=args.sigma_data).to(device).eval()

@@ -187,31 +187,15 @@ if torch is not None:
         raise ValueError(f"未知 arch: {arch!r} (可选: unet / corrdiff)")
 
 
-def save_loss_history(out, history, plot=False):
-    """把逐 epoch 的 train/val loss 存成 loss_history.json(一等产物, 不再靠解析 stdout 日志);
-    plot=True 时另存 loss_curve.png(train 与 val 同图)。只应由 rank0 调用。
-    每 epoch 覆写 JSON 以防作业被杀时丢历史; PNG 通常只在训练末尾画一次。
-    matplotlib 缺失/绘图失败不影响训练: 只跳过 PNG, JSON 照存。"""
+def save_loss_history(out, history):
+    """把逐 epoch 的 train/val loss 存成 loss_history.json(一等产物, 不再靠解析 stdout 日志)。
+    只应由 rank0 调用; 每 epoch 覆写以防作业被杀时丢历史。
+
+    训练作业只产出这份数据, 不产出曲线图: 各方法的横轴单位本就不同(有 epoch 边界的按
+    epoch, 洗牌无放回连续帧流的按累计样本数), 把绘图放进训练循环就得为每种口径各写一份,
+    而这些实现彼此看不见对方, 同一条曲线会画成几个样子。绘图统一由评测侧入口负责。"""
     path = os.path.join(out, "loss_history.json")
     json.dump(history, open(path, "w"), indent=2)
-    if not plot:
-        return path
-    try:
-        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-        eps = [h["epoch"] for h in history]
-        tr = [h.get("train") for h in history]
-        va = [h.get("val") for h in history]
-        fig, ax = plt.subplots(figsize=(7, 4))
-        if any(v is not None for v in tr):
-            ax.plot(eps, tr, "-o", ms=3, label="train")
-        if any(v is not None for v in va):
-            ax.plot(eps, va, "-o", ms=3, label="val")
-        ax.set_xlabel("epoch"); ax.set_ylabel("masked MSE (normalized)")
-        ax.legend(); ax.grid(alpha=0.3)
-        fig.savefig(os.path.join(out, "loss_curve.png"), dpi=130, bbox_inches="tight")
-        plt.close(fig)
-    except Exception as e:
-        print(f"  [loss_history] 绘图跳过({type(e).__name__}: {e}); JSON 已存 {path}", flush=True)
     return path
 
 
@@ -256,7 +240,7 @@ def _deterministic_resume_contract(args, dp_size, steps, tr_span):
     """
     fields = (
         "model", "era5_dir", "daymet_dir", "stats_dir",
-        "in_vars", "out_vars", "use_clim", "train_years", "val_years",
+        "in_vars", "out_vars", "train_years", "val_years",
         "full_frame", "epoch_frames", "steps_per_epoch", "batch",
         "lr", "weight_decay", "lr_patience", "lr_factor", "min_lr",
         "patience", "grad_clip", "amp", "val_steps",
@@ -317,6 +301,40 @@ def _resume_contract_mismatches(saved, current):
     return diffs
 
 
+def check_resume_args(ck, args, keys, world=None, path_keys=()):
+    """核对续训命令行与 checkpoint 记录的关键参数, 不一致直接拒绝启动。
+
+    ``keys`` 里的参数(patch 几何、噪声与归一化口径、学习率等)在续训段写错不会
+    触发任何形状或运行时错误, 只会让后续训练在另一套口径下无声进行, 因此必须在
+    启动时逐项与 checkpoint 内保存的 args 比对。预算与运行位置类参数(duration /
+    max_seconds / out / workers 等)不列入 ``keys`` —— 续训加预算是合法操作。
+    ``path_keys`` 内的字符串按绝对路径比较。``world`` 给定且 checkpoint 附带全
+    rank RNG 时, 同时核对 rank 数: rank 数一变, 每 rank 取帧序列"不重不漏"的
+    契约即被破坏, 即使模型参数照常载入。
+    """
+    saved = ck.get("args")
+    if not isinstance(saved, dict):
+        raise RuntimeError("checkpoint 未记录 args, 无法核对续训参数一致性")
+    cur = vars(args)
+    diffs = []
+    for k in keys:
+        if k not in saved or k not in cur:
+            continue
+        a, b = saved[k], cur[k]
+        if k in path_keys:
+            a = os.path.abspath(a) if a else a
+            b = os.path.abspath(b) if b else b
+        if _contract_value(a) != _contract_value(b):
+            diffs.append(f"{k}: checkpoint={saved[k]!r}, current={cur[k]!r}")
+    rng_states = ck.get("rng")
+    if world is not None and isinstance(rng_states, (list, tuple)) \
+            and len(rng_states) != world:
+        diffs.append(f"world: checkpoint={len(rng_states)} ranks, current={world} ranks")
+    if diffs:
+        raise RuntimeError("续训参数与 checkpoint 不一致, 拒绝启动:\n  "
+                           + "\n  ".join(diffs))
+
+
 # ===========================================================================
 # 4. DDP
 # ===========================================================================
@@ -360,7 +378,7 @@ def run(args):
 
     stats = Stats(args.stats_dir, args.in_vars, args.out_vars)
     Cout = len(args.out_vars)
-    Cin = cond_channels(args.in_vars, args.out_vars, args.use_clim)   # ERA5 + [Δz,lc,lsm](+气候态 if --use-clim)
+    Cin = cond_channels(args.in_vars)                 # ERA5 动态 + [Δz, 高程, lc, lsm] + [doy_sin, doy_cos]
     in_ch = Cin + (Cout if args.model == "diffusion" else 0)
     temb = 128 if args.model == "diffusion" else 0
     model = UNet(in_ch, Cout, base=args.base, temb=temb,
@@ -368,7 +386,7 @@ def run(args):
     diff = Diffusion(args.diff_steps, device) if args.model == "diffusion" else None
 
     if not args.eval_only:
-        data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
+        data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats)
         ds = PatchDS(data, args.patch, args.steps_per_epoch * args.batch, seed=1234 + rank)
         dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, num_workers=args.workers,
                                          drop_last=True, pin_memory=True, worker_init_fn=ds_worker_init)
@@ -391,7 +409,7 @@ def run(args):
                 save_loss_history(args.out, history)
         if is_main:
             if history:
-                save_loss_history(args.out, history, plot=True)
+                save_loss_history(args.out, history)
             torch.save({"model": model.state_dict(), "args": vars(args)}, os.path.join(args.out, "ckpt.pt"))
             print("  -> ckpt.pt", flush=True)
         if is_dist:
@@ -413,7 +431,7 @@ def evaluate(model, diff, stats, args, device, is_main=True):
     """is_main=False(仅序列并行整幅评测时): 本 rank 只参与每天的前向集合通信(det_predict 里
     模型 all-gather K/V), 不累计指标/不写文件 -> 让整幅评测也 ~1/sp 快, 而非 rank0 单卡 136s/帧。"""
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-    test = DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year], args.in_vars, args.out_vars, stats, use_clim=getattr(args, "use_clim", False))
+    test = DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year], args.in_vars, args.out_vars, stats)
     model.eval(); Cout = len(args.out_vars); y = args.test_year
     days = list(range(0, test.ndays[y], args.eval_stride))
     agg = {v: dict(se=0., ae=0., be=0., n=0., sp=0., st=0., spp=0., stt=0., spt=0., crps=0., nd=0) for v in args.out_vars}
@@ -487,8 +505,6 @@ def add_common_args(p):
     p.add_argument("--stats-dir", default="stats_train")
     p.add_argument("--in-vars", nargs="+", default=DEFAULT_IN)
     p.add_argument("--out-vars", nargs="+", default=TARGETS)
-    p.add_argument("--use-clim", action="store_true",
-                   help="保留 3 个逐日气候态条件通道 -> 23 通道(旧口径); 默认关=20 通道(指南口径)")
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["train"])   # 1980-2017
     p.add_argument("--val-years", type=int, nargs="+", default=M.splits["val"])       # 2018-2019(早停监控)
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])              # 2020(最终评测)
@@ -511,7 +527,7 @@ def add_common_args(p):
                    help="梯度裁剪 max-norm; 0=关闭(UNet baseline 口径)。Transformer 建议 1.0")
     p.add_argument("--pos-grid", type=int, default=0, choices=[0, 4],
                    help="给 UNet 额外拼 4 个正弦位置通道(全域归一化坐标的 sin/cos), 0=关闭。"
-                        "属模型内部输入, 不改变 20 通道数据合同")
+                        "属模型内部输入, 不改变 21 通道数据合同")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--resume-from", default="",
                    help="从同一 --out 目录内的完整 last.pt 接续；--epochs 是续训后的累计目标 epoch")
@@ -551,8 +567,8 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
     seed_off = sp_ctx["dp_rank"] if sp else rank
     if is_main:
         os.makedirs(args.out, exist_ok=True)
-    tr_data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
-    va_data = DownscaleData(args.era5_dir, args.daymet_dir, args.val_years, args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
+    tr_data = DownscaleData(args.era5_dir, args.daymet_dir, args.train_years, args.in_vars, args.out_vars, stats)
+    va_data = DownscaleData(args.era5_dir, args.daymet_dir, args.val_years, args.in_vars, args.out_vars, stats)
     full_frame = getattr(args, "full_frame", False)
     # DDP steps 修复(4.4): 固定"每 epoch 见 epoch_frames 帧", steps 随数据并行度收缩 -> 加节点真省墙钟。
     # (SP 用 dp_size 而非 world: SP 组内是同一帧的 token 切分, 不增加帧吞吐。)
@@ -763,7 +779,7 @@ def fit_deterministic(model, stats, args, device, ddp_info, sp_ctx=None):
                 print(f"  早停: val 连续 {args.patience} 个 epoch 没提升 (best={best:.4f})", flush=True)
             break
     if is_main and history:
-        save_loss_history(args.out, history, plot=True)   # 训练末尾画 train/val 曲线
+        save_loss_history(args.out, history)   # 末尾兜底一次, 防最后一轮的逐 epoch 写盘失败
     if is_dist:
         dist.barrier()
     if is_main and os.path.exists(ckpt):
@@ -814,8 +830,6 @@ def main():
     p.add_argument("--stats-dir", default="stats_train")
     p.add_argument("--in-vars", nargs="+", default=DEFAULT_IN)
     p.add_argument("--out-vars", nargs="+", default=TARGETS)
-    p.add_argument("--use-clim", action="store_true",
-                   help="保留 3 个逐日气候态条件通道 -> 23 通道(旧口径); 默认关=20 通道(指南口径)")
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["val"])
     p.add_argument("--test-year", type=int, default=M.splits["test"][0])
     p.add_argument("--out", default=str(PROJECT_ROOT / "runs/exp")); p.add_argument("--ckpt", default=str(PROJECT_ROOT / "runs/exp/ckpt.pt"))

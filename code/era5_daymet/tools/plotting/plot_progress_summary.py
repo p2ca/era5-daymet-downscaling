@@ -21,16 +21,13 @@ import os
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
+
+from era5_daymet.tools.plotting.mpl_style import use_cjk
 
 from era5_daymet.paths import PROJECT_ROOT
 
-FONT = os.path.expanduser("~/.fonts/NotoSansSC-Regular.otf")
-if os.path.exists(FONT):
-    fm.fontManager.addfont(FONT)
-    plt.rcParams["font.family"] = fm.FontProperties(fname=FONT).get_name()
-plt.rcParams["axes.unicode_minus"] = False
+use_cjk()
 
 # --- 调色 (dataviz reference palette, light mode) ---
 GREY   = "#898781"   # chrome/muted: 插值基线 = 参照物, 不是分类系列

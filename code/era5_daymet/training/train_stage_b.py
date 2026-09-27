@@ -33,7 +33,8 @@ from era5_daymet.models.corrdiff_loss import ResidualLoss
 from era5_daymet.models.patching import RandomPatching2D
 from era5_daymet.models.preconditioning import EDMPrecondSuperResolution
 from era5_daymet.training import train_downscale as TD
-from era5_daymet.training.stage_b_mean import CachedRegressionMean, pin_ocean
+from era5_daymet.training.stage_b_mean import (CachedRegressionMean, pin_ocean,
+                                               stage_b_cond_channels)
 
 
 class FrameStream(torch.utils.data.Dataset):
@@ -116,6 +117,16 @@ def _rng_gather(is_dist, world, st):
     return lst
 
 
+# 续训时必须与 checkpoint 逐项一致的参数。patch 几何与损失口径不改变任何参数形状,
+# 在续训段写错只会静默换口径; 预算类参数(duration / max_seconds)不在此列。
+RESUME_PINNED_ARGS = (
+    "target", "cache", "stage_a_ckpt", "stats_dir", "era5_dir", "daymet_dir",
+    "train_years", "val_years", "model_channels", "channel_mult", "n_grid_channels",
+    "patch", "patch_num", "min_land", "p_mean", "p_std", "sigma_data",
+    "lr", "grad_clip", "seed", "save_rng", "val_steps",
+)
+
+
 def main():
     p = argparse.ArgumentParser(description="CorrDiff 阶段 B 训练")
     p.add_argument("--cache", required=True)
@@ -174,7 +185,7 @@ def main():
     H, W = tr.H, tr.W
 
     net = EDMPrecondSuperResolution(
-        img_resolution=[H, W], img_in_channels=41 + args.n_grid_channels, img_out_channels=1,
+        img_resolution=[H, W], img_in_channels=stage_b_cond_channels(n_grid=args.n_grid_channels), img_out_channels=1,
         model_type="SongUNetPosEmbd", model_channels=args.model_channels,
         channel_mult=list(args.channel_mult), attn_resolutions=[16],
         N_grid_channels=args.n_grid_channels, gridtype="learnable",
@@ -200,8 +211,13 @@ def main():
     # 取帧序列由全局序号唯一决定, 故只需把本 rank 的起点后移 done_steps, 长度相应缩短 ——
     # 既不重复已训过的帧, 也不跳过未训的帧。
     ck = None
-    if args.resume and Path(args.resume).exists():
+    if args.resume:
+        if not Path(args.resume).exists():
+            raise SystemExit(f"--resume 指定的断点不存在: {args.resume}")
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        TD.check_resume_args(ck, args, RESUME_PINNED_ARGS, world=world,
+                             path_keys=("cache", "stage_a_ckpt", "stats_dir",
+                                        "era5_dir", "daymet_dir"))
     done_steps = (ck["samples"] // per_step) if ck else 0
     if done_steps >= steps_total:
         raise SystemExit(f"断点已达 {ck['samples']:,} samples >= duration {args.duration:,}")
@@ -253,13 +269,19 @@ def main():
 
     def run_batch(cond, tgt, mu, land, train=True, prng=None):
         cond = cond.to(device, non_blocking=True); tgt = tgt.to(device, non_blocking=True)
-        mu = pin_ocean(mu.to(device, non_blocking=True), land.to(device, non_blocking=True))
         land = land.to(device, non_blocking=True)
+        mu = pin_ocean(mu.to(device, non_blocking=True), land)
+        # 海洋无有效真值(Daymet 为常数填充): target 在海洋上取 μ, 使海洋残差恒为 0。
+        # 陆地掩膜只挡得住 loss, 挡不住残差作为网络输入经卷积感受野进入沿海预测,
+        # 必须在数据侧清零
+        tgt = tgt * land + mu * (1.0 - land)
         patching.set_patch_num(args.patch_num)           # ★官方靠此副作用重掷位置
         reseat_patches(patching, land, args.patch, args.min_land, prng if prng is not None else rng)
         reg.set(mu)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device != "cpu")):
-            l = loss_fn(net=model.module if is_dist else net, img_clean=tgt, img_lr=cond,
+            # 前向必须走 DDP 包装体: 梯度同步由其 forward 钩子武装, 传裸网络会静默跳过
+            # 跨 rank 归约, 各 rank 各训各的(非分布式时 model 即裸网络本身)
+            l = loss_fn(net=model, img_clean=tgt, img_lr=cond,
                         patching=patching, use_patch_grad_acc=False)
         lp = patching.apply(land)                        # 与损失同一批位置
         return (l.float() * lp).sum() / lp.sum().clamp_min(1.0)
@@ -283,6 +305,21 @@ def main():
         # DDP 已同步梯度, 各 rank 的范数相同; 裁剪前范数入曲线供稳定性监控
         gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip))
         opt.step()
+        if is_dist and step == 1:
+            # 首步同步自检: DDP 生效时全 rank 由同一平均梯度更新, 参数应逐位一致;
+            # 若前向被改回裸网络, 在这里立刻拦下, 而不是无声跑完整个作业
+            fp = torch.zeros(2, dtype=torch.float64, device=device)
+            for q in net.parameters():
+                fp[0] += q.detach().double().sum()
+                fp[1] += q.detach().double().abs().sum()
+            fps = [torch.zeros_like(fp) for _ in range(world)]
+            dist.all_gather(fps, fp)
+            worst = max(float((f - fps[0]).abs().max()) for f in fps)
+            if worst > 1e-6 * max(1.0, float(fps[0][1])):
+                raise RuntimeError(
+                    f"首步后各 rank 参数不一致 (max dev {worst:.3e}) —— DDP 梯度同步失效")
+            if is_main:
+                print("[stageB] DDP 首步同步自检通过 (全 rank 参数一致)", flush=True)
         seen += per_step
         run_sum += float(loss.detach()); run_n += 1.0
         gn_sum += gn; gn_max = max(gn_max, gn)

@@ -68,7 +68,7 @@ def main():
 
     rank, world, local, device, is_dist = TD.setup_ddp()
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
-    Cin = TD.cond_channels(args.in_vars, args.out_vars, args.use_clim)  # bilinear(ERA5)+Δz+lc+lsm(+气候态 if --use-clim)
+    Cin = TD.cond_channels(args.in_vars)    # bilinear(ERA5) + Δz + 高程 + lc + lsm + doy_sin/cos
     Cout = len(args.out_vars)
     model = TD.build_regressor(Cin, Cout, args).to(device)
     n_par = sum(x.numel() for x in model.parameters())

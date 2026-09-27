@@ -24,25 +24,59 @@ FACTOR = 6
 TARGETS = ["2m_temperature_max", "2m_temperature_min", "total_precipitation_24hr"]
 PRECIP = "total_precipitation_24hr"
 
-# 输入合同: 17 个 ERA5 动态变量, 必须严格按此顺序读取。
-# 加 3 个 Daymet 静态通道(Δz / landcover / land_sea_mask) => 条件通道 = 17+3 = 20(默认)。
-# use_clim=True 时另加 3 个逐日气候态通道 -> 23 通道, 仅用于复现早期 23 通道实验。
+# 输入合同: 15 个 ERA5 动态变量, 必须严格按此顺序读取。
+# 加 4 个 Daymet 静态通道与 2 个时间通道 => 条件通道 = 15+4+2 = 21(默认)。
 DEFAULT_IN = ["2m_temperature", "2m_temperature_max", "2m_temperature_min",
-              "total_precipitation_24hr", "10m_u_component_of_wind", "10m_v_component_of_wind",
+              "total_precipitation_24hr",
               "volumetric_soil_water_layer_1", "geopotential_500", "geopotential_850",
               "specific_humidity_500", "specific_humidity_850", "temperature_500", "temperature_850",
               "u_component_of_wind_500", "u_component_of_wind_850",
               "v_component_of_wind_500", "v_component_of_wind_850"]
 
+# 静态与时间通道的符号名。这里的顺序**就是**条件张量里静态段与时间段的拼接顺序: 取数
+# (DownscaleData.get_patch)与通道敏感性分组都从这里派生, 不在别处再写一份。通道错位不会
+# 报错, 只会让指标悄悄变差, 因此布局只能有一个定义处。
+DZ = "dz"                       # HR 高程 − 上采样 LR 高程: 亚网格地形, 递减率订正的来源
+ELEVATION = "elevation"         # HR 绝对高程: 递减率与气压高度的绝对参考
+LANDCOVER = "landcover"
+LAND_SEA_MASK = "land_sea_mask"
+STATIC_ORDER = (DZ, ELEVATION, LANDCOVER, LAND_SEA_MASK)
+
+DOY_SIN = "doy_sin"
+DOY_COS = "doy_cos"
+TIME_ORDER = (DOY_SIN, DOY_COS)
+
+# 日历每年恒 365 天(闰年丢 12/31), 所以"年内第几天"直接就是季节相位, 与逐日气候态的
+# slot 同口径, 跨年对齐无漂移。
+DAYS_PER_YEAR = 365
+
 # log1p(mm) 的物理上界: 世界日降水纪录约 1825 mm -> log1p ≈ 7.51。取 8.0 (≈2980 mm) 已极宽松。
 PRECIP_LOG_MAX = 8.0
 
 
-def cond_channels(in_vars, out_vars, use_clim):
-    """条件输入通道数: len(ERA5 动态) + 3 静态(dz/lc/lsm) + (气候态 = len(out_vars) if use_clim)。
-    默认 use_clim=False -> 20 通道(指南口径); use_clim=True -> 23(旧口径)。
+def doy_sincos(day_index):
+    """年内第 day_index 天(0 起) -> (sin, cos), 用作空间上为常数的时间条件通道。
+
+    (sin, cos) 对 day index 是双射, 年内相位无损, 且 12/31 -> 1/1 处不跳变; 只取 sin 会让
+    春秋各有一天落到同一个值上, 网络分不出来。二次谐波 sin(4πd/D) = 2·sin(2πd/D)·cos(2πd/D)
+    只是这两个通道的乘积, 带逐点非线性的网络自己就能合成, 所以不另设通道。
+    值域已在 [-1,1] 且全年均值为 0, 不再做 z-score。
+    """
+    a = 2.0 * np.pi * (float(day_index) % DAYS_PER_YEAR) / DAYS_PER_YEAR
+    return float(np.sin(a)), float(np.cos(a))
+
+
+def cond_layout(in_vars):
+    """条件张量的通道名列表, 顺序即 DownscaleData.get_patch 的拼接顺序:
+    ERA5 动态 -> 静态(STATIC_ORDER) -> 时间(TIME_ORDER)。"""
+    return list(in_vars) + list(STATIC_ORDER) + list(TIME_ORDER)
+
+
+def cond_channels(in_vars):
+    """条件输入通道数 = len(cond_layout(in_vars)); 15 动态 + 4 静态 + 2 时间 = 21。
+
     训练/评测/构模所有地方都用它, 保证与 DownscaleData.get_patch 拼出的 cond 通道数一致。"""
-    return len(in_vars) + 3 + (len(out_vars) if use_clim else 0)
+    return len(cond_layout(in_vars))
 
 
 def precip_fwd(p, clip, scale):

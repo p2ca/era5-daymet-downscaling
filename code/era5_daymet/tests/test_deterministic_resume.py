@@ -19,8 +19,7 @@ from era5_daymet.training import train_downscale as TD
 class _FakeFullFrameData:
     """Small deterministic replacement for DownscaleData used by this test."""
 
-    def __init__(self, _era5, _daymet, years, _in_vars, _out_vars, _stats, use_clim=False):
-        del use_clim
+    def __init__(self, _era5, _daymet, years, _in_vars, _out_vars, _stats):
         self.years = list(years)
         self.ndays = {y: (7 if y == 2000 else 5) for y in self.years}
 
@@ -41,7 +40,6 @@ def _args(out, epochs, resume_from=""):
         stats_dir="fake_stats",
         in_vars=["x"],
         out_vars=["y"],
-        use_clim=False,
         train_years=[2000],
         val_years=[2001],
         test_year=2002,
@@ -210,10 +208,35 @@ def test_two_rank_ddp_continuous_equals_resume():
         mp.spawn(_ddp_worker, args=(2, init_method, root), nprocs=2, join=True)
 
 
+def test_check_resume_args_rejects_silent_divergence():
+    ck = {"args": {"patch": 192, "lr": 2e-4}, "rng": [None, None]}
+    good = SimpleNamespace(patch=192, lr=2e-4)
+    TD.check_resume_args(ck, good, ("patch", "lr"), world=2)
+    cases = (
+        (SimpleNamespace(patch=256, lr=2e-4), 2, "patch"),
+        (SimpleNamespace(patch=192, lr=1e-4), 2, "lr"),
+        (good, 3, "world"),
+    )
+    for bad, world, key in cases:
+        try:
+            TD.check_resume_args(ck, bad, ("patch", "lr"), world=world)
+        except RuntimeError as e:
+            assert key in str(e), (key, str(e))
+        else:
+            raise AssertionError(f"check_resume_args 未拦下不一致的 {key}")
+    try:
+        TD.check_resume_args({"model": {}}, good, ("patch",))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("缺 args 的 checkpoint 未被拒绝")
+
+
 def main():
     tests = (
         test_continuous_equals_segmented_resume,
         test_resume_rejects_wrong_lr_and_output_directory,
+        test_check_resume_args_rejects_silent_divergence,
         test_two_rank_ddp_continuous_equals_resume,
     )
     for test in tests:

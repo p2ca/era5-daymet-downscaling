@@ -54,24 +54,15 @@ class MultiMethodEval:
         self.acc_log = {m: DB.Acc() for m in methods}
         self.msum = {m: np.zeros((self.Cout, H, W), np.float64) for m in methods}
         self.tsum = np.zeros((self.Cout, H, W), np.float64); self.nd = 0
-        self.spec = {}                                            # 首日: spec['truth'][v], spec[m][v]={'mean','member'}
         self.rh = {m: [] for m in methods}                       # rank hist(仅集合方法)
         self.N = {m: 1 for m in methods}
-        self.box = None
         self.mb_er = None                                         # 腐蚀过的陆地掩膜(SSIM 用)
 
     def add_day(self, hr, mask, members_by_method):
         mb = (mask[0] if mask.ndim == 3 else mask) > 0.5
-        if self.box is None:
-            self.box = MT.pick_land_box(mb, min(384, self.H, self.W))
-            # ★功率谱改为★全年累加求平均★(不再只取首日快照); 首日把累加器初始化为 0
-            self.spec["truth"] = {v: 0.0 for v in self.ov}
         if self.mb_er is None:
             self.mb_er = eroded_land_mask(mb)
-        by, bx, bs = self.box; first = (self.nd == 0)
         self.tsum += hr; self.nd += 1
-        for i, v in enumerate(self.ov):                          # 累加 truth 功率谱(全年平均, _plots 里除以 nd)
-            self.spec["truth"][v] = self.spec["truth"][v] + MT.radial_psd(hr[i][by:by+bs, bx:bx+bs], bs)
         pi = self.ov.index(PRECIP) if PRECIP in self.ov else None
         lg = lambda a: np.log1p(np.maximum(a, 0) * self.pscale)   # 物理量 -> log1p(mm)
         for m in self.methods:
@@ -94,11 +85,6 @@ class MultiMethodEval:
                 self.acc_log[m].add(lg(ens[pi])[mb], lg(hr[pi])[mb])
             if mem.shape[0] > 1:
                 self.rh[m].append(MT.rank_hist(mem, hr, (mask[0] if mask.ndim == 3 else mask)))
-            if m not in self.spec:                               # 首次见到该方法 -> 初始化功率谱累加器
-                self.spec[m] = {v: {"mean": 0.0, "member": 0.0} for v in self.ov}
-            for i, v in enumerate(self.ov):                      # 累加方法功率谱(全年平均)
-                self.spec[m][v]["mean"] = self.spec[m][v]["mean"] + MT.radial_psd(ens[i][by:by+bs, bx:bx+bs], bs)
-                self.spec[m][v]["member"] = self.spec[m][v]["member"] + MT.radial_psd(mem[0, i][by:by+bs, bx:bx+bs], bs)
 
     # -------------------------------------------------------------------
     def finalize(self, out_dir, test_year, eval_stride=1, tag="all", n_total_days=None,
@@ -223,26 +209,6 @@ class MultiMethodEval:
         except Exception as e:
             print(f"(无 matplotlib, 跳过画图: {e})"); return
         cmap_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
-        by, bx, bs = self.box; k = np.arange(1, bs // 2)
-        nd = max(self.nd, 1)                                       # 功率谱是全年累加 -> 除以天数得平均
-
-        # (a) 逐变量功率谱(全年平均): truth(黑) + 各方法均值(实线); 集合方法额外画单成员(虚线)
-        fig, axes = plt.subplots(1, self.Cout, figsize=(5.2 * self.Cout, 4.3), squeeze=False)
-        for i, v in enumerate(self.ov):
-            ax = axes[0, i]
-            ax.loglog(k, (self.spec["truth"][v] / nd)[1:bs // 2], "k-", lw=2.4, label="truth")
-            for j, m in enumerate(self.methods):
-                col = cmap_cycle[j % len(cmap_cycle)]
-                ax.loglog(k, (self.spec[m][v]["mean"] / nd)[1:bs // 2], "-", color=col, label=f"{m} (mean)")
-                if self.N[m] > 1:
-                    ax.loglog(k, (self.spec[m][v]["member"] / nd)[1:bs // 2], "--", color=col, alpha=.7, label=f"{m} (member)")
-            ax.set_xlabel("radial wavenumber"); ax.set_ylabel("power"); ax.set_title(v)
-            ax.grid(True, which="both", alpha=.3)
-            if i == 0:
-                ax.legend(fontsize=7)
-        fig.suptitle("RAPSD (closer to truth at high-k = sharper; member should match truth, mean is smoother)")
-        fig.tight_layout(); fig.savefig(os.path.join(out_dir, f"spectrum_{tag}.png"), dpi=130, bbox_inches="tight")
-        plt.close(fig)
 
         # (b) 年平均地图: 上排 truth+各方法均值场, 下排 各方法-truth 偏差
         if not make_maps:
@@ -287,7 +253,7 @@ class MultiMethodEval:
                 a.set_title(f"rank hist {m} (tmax, flat=calibrated)", fontsize=9)
             fig.tight_layout(); fig.savefig(os.path.join(out_dir, f"rankhist_{tag}.png"), dpi=130, bbox_inches="tight")
             plt.close(fig)
-        print(f"图 -> {out_dir}/spectrum_{tag}.png, maps_{tag}_*.png" + (f", rankhist_{tag}.png" if ens_methods else ""))
+        print(f"图 -> {out_dir}/maps_{tag}_*.png" + (f", rankhist_{tag}.png" if ens_methods else ""))
 
 
 def merge_sums_and_finalize(sum_paths, out_dir, test_year, tag="corrdiff",

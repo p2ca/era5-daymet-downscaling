@@ -54,9 +54,10 @@ from era5_daymet.models.preconditioning import EDMPrecondSuperResolution
 from era5_daymet.models.stochastic_sampler import stochastic_sampler
 from era5_daymet import contract as C
 from era5_daymet.data import dataset as DS
+from era5_daymet.evaluation import fields as FI
 from era5_daymet.evaluation import metrics as MT
 from era5_daymet.models import tiled_inference as TI
-from era5_daymet.training.stage_b_mean import pin_ocean
+from era5_daymet.training.stage_b_mean import pin_ocean, stage_b_cond_channels
 
 # 采样时始终落盘的场(降水追加 crps_log)
 BASE_FIELDS = ("ens_mean", "crps", "spread", "rank")
@@ -113,11 +114,10 @@ def apply_ablation(cond, slots, mode, donor=None):
 
 def load_stage_a(ckpt_path, device):
     """载入单目标阶段 A 回归网络(冻结、推理态), 用于在置换后的条件上现算 μ。"""
-    from era5_daymet.tools.plotting import plot_unet_annual_maps as PU
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ck = payload.get("args", {})
-    cin = C.cond_channels(list(ck.get("in_vars", C.DEFAULT_IN)), C.TARGETS, False)
-    net = PU._build_model(ck, cin, 1, device)
+    cin = C.cond_channels(list(ck.get("in_vars", C.DEFAULT_IN)))
+    net = FI.build_model(ck, cin, 1, device)
     net.load_state_dict(payload["model"])
     net.eval()
     for p in net.parameters():
@@ -137,6 +137,26 @@ def file_sig(path):
     return {"path": str(p), "bytes": st.st_size, "mtime": int(st.st_mtime)}
 
 
+def ckpt_train_patch(path):
+    """从阶段 B checkpoint 取训练时的 patch 边长; 未记录则返回 None。"""
+    ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True).get("args", {})
+    ck = ck if isinstance(ck, dict) else vars(ck)
+    return int(ck["patch"]) if ck.get("patch") else None
+
+
+def resolve_patch(cli_patch, train_patch, ckpt_path=""):
+    """定下推理切块边长, 返回 (patch, 是否偏离训练几何)。
+
+    缺省取训练值; 显式指定是合法的几何扫描用法, 但调用方须把偏离记进 meta。
+    训练值不可知且调用方也没给时直接拒绝 —— 此处退回任何默认数字都是静默的错口径。
+    """
+    if cli_patch is None:
+        if train_patch is None:
+            raise ValueError(f"{ckpt_path} 未记录训练 patch, 必须显式给 --patch")
+        return train_patch, False
+    return cli_patch, train_patch is not None and cli_patch != train_patch
+
+
 def write_meta(out, a, days):
     meta = {
         "id": Path(out).name,
@@ -147,7 +167,8 @@ def write_meta(out, a, days):
         "diffusion_ckpt": file_sig(a.diffusion_ckpt),
         "stage_a_ckpt": file_sig(a.stage_a_ckpt),
         "mu_cache": a.cache,
-        "config": {"patch": a.patch, "overlap": a.overlap, "boundary": a.boundary},
+        "config": {"patch": a.patch, "train_patch": getattr(a, "train_patch", None),
+                   "overlap": a.overlap, "boundary": a.boundary},
         "members": a.members,
         "steps": a.steps,
         "sigma": {"min": a.sigma_min, "max": a.sigma_max, "data": a.sigma_data},
@@ -223,7 +244,9 @@ def main():
     ap.add_argument("--save-mu", action="store_true",
                     help="额外落盘阶段 A 的 μ(物理单位), 供离线做阶段 A/B 误差分解")
     ap.add_argument("--members", type=int, default=32)
-    ap.add_argument("--patch", type=int, default=192)
+    ap.add_argument("--patch", type=int, default=None,
+                    help="推理切块边长; 缺省取 checkpoint 记录的训练 patch。"
+                         "显式指定即视为有意偏离训练几何, 会回显并记进 meta")
     ap.add_argument("--overlap", type=int, required=True)
     ap.add_argument("--boundary", type=int, required=True)
     ap.add_argument("--steps", type=int, default=18)
@@ -252,6 +275,16 @@ def main():
 
     out.mkdir(parents=True, exist_ok=True)
     mine = days[rank::ntasks]
+
+    # 推理切块边长必须显式定下来: 网络全卷积, 换个 patch 照样跑通、场也照样出得来,
+    # 不报任何错, 只是整年采样都在与训练不同的几何上做。故缺省取 checkpoint 自述的
+    # 训练 patch; 显式指定是合法的几何扫描用法, 但要回显并记进 meta。
+    a.train_patch = ckpt_train_patch(a.diffusion_ckpt)
+    a.patch, deviates = resolve_patch(a.patch, a.train_patch, a.diffusion_ckpt)
+    if deviates and rank == 0:
+        print(f"[dump] ★推理 patch {a.patch} != 训练 patch {a.train_patch}: "
+              f"有意偏离训练几何, 已记入 meta.config.train_patch", flush=True)
+
     if rank == 0:
         write_meta(out, a, days)
 
@@ -275,13 +308,27 @@ def main():
     print(f"[dump] rank {rank}/{ntasks} device={device} 分到 {len(mine)} 天; ablate={a.ablate or '-'}; 场={fields_for(a.target, a.save_mu)}",
           flush=True)
 
+    # 网络结构与 sigma_data 一律以 checkpoint 自述为准, 命令行只作缺省。
+    # 结构参数对不上会在 load_state_dict 当场报错; 而 sigma_data 不改变任何形状 ——
+    # 传错了照样装得回去, 只是采样全程用错的预条件系数, 不报任何错。
+    payload = torch.load(a.diffusion_ckpt, map_location=device)
+    ck = payload.get("args", {})
+    ck = ck if isinstance(ck, dict) else vars(ck)
+    sigma_data = float(ck.get("sigma_data", a.sigma_data))
+    if abs(sigma_data - a.sigma_data) > 1e-12:
+        raise ValueError(
+            f"--sigma-data={a.sigma_data} 与 checkpoint 记录的 {sigma_data} 不符; "
+            f"它不改变张量形状, 用错不会报错只会让采样结果错, 故此处拒绝继续")
+    n_grid = int(ck.get("n_grid_channels", 100))
     net = EDMPrecondSuperResolution(
-        img_resolution=[H, W], img_in_channels=41 + 100, img_out_channels=1,
-        model_type="SongUNetPosEmbd", model_channels=a.model_channels,
-        channel_mult=[1, 2, 2], attn_resolutions=[16],
-        N_grid_channels=100, gridtype="learnable",
-        sigma_data=a.sigma_data).to(device).eval()
-    net.load_state_dict(torch.load(a.diffusion_ckpt, map_location=device)["model"])
+        img_resolution=[H, W], img_out_channels=1,
+        img_in_channels=stage_b_cond_channels(n_grid=n_grid),
+        model_type="SongUNetPosEmbd",
+        model_channels=int(ck.get("model_channels", a.model_channels)),
+        channel_mult=list(ck.get("channel_mult", [1, 2, 2])), attn_resolutions=[16],
+        N_grid_channels=n_grid, gridtype="learnable",
+        sigma_data=sigma_data).to(device).eval()
+    net.load_state_dict(payload["model"])
     patching = GridPatching2D(img_shape=(H, W), patch_shape=(a.patch, a.patch),
                               overlap_pix=a.overlap, boundary_pix=a.boundary)
     is_precip = a.target == C.PRECIP

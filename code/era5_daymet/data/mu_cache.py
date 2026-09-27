@@ -10,8 +10,9 @@ mu_cache.py — 阶段 A 回归均值 μ 的缓存读取
 缓存按 `<目标>/<年份>.npy` 存放, 形状 (ndays, H, W), float16, 归一化空间。读取时 memmap,
 不整年载入内存。
 
-★ 缓存与产生它的阶段 A checkpoint 强绑定: manifest 里记了每个 checkpoint 的 SHA-256,
-`verify()` 对不上就直接抛错(fail-closed)。阶段 A 一旦重训, 旧缓存必须重建。
+★ 缓存与产生它的阶段 A checkpoint 强绑定: manifest 里记了每个 checkpoint 的 SHA-256
+与当时的 ERA5 输入变量表, `verify()` 两者都核, 对不上就直接抛错(fail-closed)。
+阶段 A 一旦重训或输入口径变更, 旧缓存必须重建。
 ============================================================================
 """
 import hashlib
@@ -19,6 +20,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+
+from era5_daymet.contract import DEFAULT_IN
 
 
 def file_sha256(path):
@@ -45,10 +48,20 @@ class MuCache:
         self._mm = {}
 
     def verify(self, ckpt_paths):
-        """核对缓存所绑定的阶段 A checkpoint; 不一致直接抛错。
+        """核对缓存的输入口径与所绑定的阶段 A checkpoint; 不一致直接抛错。
 
         `ckpt_paths` 为 {目标: checkpoint 路径}。
+
+        输入口径必须单独核: μ 是逐日的 (H, W) 标量场, 口径不符**不会引发任何形状错误**
+        —— 残差 y - μ 照样算得出来, 阶段 B 照常收敛, 只是训练目标从一开始就是错的。
+        SHA 校验挡不住这种情况: 拿旧阶段 A checkpoint 配旧缓存时它是通过的, 分叉的是
+        缓存与**当前代码**的条件通道口径。
         """
+        got = list(self.manifest.get("in_vars", []))
+        if got != list(DEFAULT_IN):
+            raise ValueError(
+                f"μ 缓存的输入口径与现行合同不符: 缓存记 {len(got)} 个 ERA5 动态输入, "
+                f"现行合同 {len(DEFAULT_IN)} 个。阶段 A 口径变更后必须重建缓存。")
         for t in self.targets:
             want = self.manifest["checkpoints"][t]["sha256"]
             got = file_sha256(ckpt_paths[t])

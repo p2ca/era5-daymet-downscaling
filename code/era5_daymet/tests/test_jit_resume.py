@@ -83,8 +83,30 @@ def check_partition():
           all(sorted(fr) == full for fr in passes.values()))
 
 
+def check_resume_guard():
+    """续训守卫: 静默参数与断点不一致、或断点路径不存在, 都必须当场拒绝。"""
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "g"
+        run(out, 24)
+        try:
+            run(out, 48, resume=out / "last.pt", extra=("--noise-scale", "2.0"))
+            ok = False
+        except RuntimeError as e:
+            ok = "noise_scale" in str(e)
+        check("noise_scale 与断点不一致的续训被拒绝", ok)
+        try:
+            run(out, 48, resume=out / "missing.pt")
+            ok = False
+        except SystemExit:
+            ok = True
+        check("断点路径不存在时拒绝启动", ok)
+        run(out, 48, resume=out / "last.pt")            # 同参数(仅加预算)不受守卫影响
+        check("同参数续训不受守卫影响", True)
+
+
 def main():
     check_partition()
+    check_resume_guard()
     for label, extra in (("dense", ()), ("moe", MOE)):
         with tempfile.TemporaryDirectory() as td:
             a, b = Path(td) / "a", Path(td) / "b"

@@ -77,9 +77,12 @@ def run_phase(label, moe, rank, world, bypass=False, steps=3):
             "各 rank 负载计数完全相同 —— 疑似被 buffer 广播覆盖"
         total = _drain_moe_load(layers, is_dist=True)
         assert torch.equal(total, others[0] + others[1]), "负载 all-reduce 聚合错误"
-        expect = len(layers) * world * steps * 2 * 24 * MC["num_experts_per_tok"]
+        # token 数取模型自报的切块网格: 随机起点要求网格补到能容下任意起点,
+        # 因此它不等于 H/patch x W/patch。
+        n_tok = net.x_embedder.gh * net.x_embedder.gw
+        expect = len(layers) * world * steps * 2 * n_tok * MC["num_experts_per_tok"]
         assert int(total.sum()) == expect, \
-            f"负载总数 {int(total.sum())} != 层数x步数x token 数x K = {expect}"
+            f"负载总数 {int(total.sum())} != 层数x步数x token 数({n_tok})x K = {expect}"
     return True
 
 

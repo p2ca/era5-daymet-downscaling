@@ -18,7 +18,18 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from era5_daymet.contract import TIME_ORDER
 from era5_daymet.models.patching import RandomPatching2D
+
+
+def _global_context(img_lr, n_constant_cond):
+    """取出要作为"全域上下文"拼给每个 patch 的通道: 末尾的空间常数通道不参与。
+
+    训练与采样必须用同一份实现 —— 两边算出的条件宽度一旦不一致, 权重就装不回去。
+    """
+    if not n_constant_cond:
+        return img_lr
+    return img_lr[:, : img_lr.shape[1] - int(n_constant_cond)]
 
 
 class ResidualLoss:
@@ -57,6 +68,7 @@ class ResidualLoss:
         P_std: float = 1.2,
         sigma_data: float = 0.5,
         hr_mean_conditioning: bool = False,
+        n_constant_cond: Optional[int] = None,
     ):
         """
         Arguments
@@ -86,12 +98,19 @@ class ResidualLoss:
             Whether to use high-resolution mean for conditioning predicted, by default False.
             When True, the mean prediction from `regression_net` is channel-wise
             concatenated with `img_lr` for conditioning.
+    n_constant_cond : int, optional
+        条件张量末尾有多少个**空间常数**通道(默认取数据合同的 TIME_ORDER 长度)。
+        这些通道在整幅上处处相同, 其"全域插值副本"与 patch 内的那一份逐点相等, 拼上去
+        贡献恒为零 —— 按 additional_input 这个机制自身的定义(让每个 patch 保有全域信息),
+        它们本就不属于它的作用范围。传 0 可复现上游行为。
         """
         self.regression_net = regression_net
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
         self.hr_mean_conditioning = hr_mean_conditioning
+        self.n_constant_cond = (len(TIME_ORDER) if n_constant_cond is None
+                                else int(n_constant_cond))
         self.y_mean = None
 
     def get_noise_params(self, y: Tensor) -> Tensor:
@@ -309,7 +328,8 @@ class ResidualLoss:
             y_patched = patching.apply(input=y)
             # Patched conditioning on y_lr and interp(img_lr)
             # (batch_size * patch_num, 2*c_in, patch_shape_y, patch_shape_x)
-            y_lr_patched = patching.apply(input=y_lr, additional_input=img_lr)
+            y_lr_patched = patching.apply(
+                input=y_lr, additional_input=_global_context(img_lr, self.n_constant_cond))
 
             y = y_patched
             y_lr = y_lr_patched

@@ -12,6 +12,8 @@ test_model_contracts.py — 已训权重与网络定义之间的结构契约
 与形状则与版本无关, 且正是"能否装回去"的充要条件。
 
 缺少某个 checkpoint 时跳过该项而非失败 —— 本测试要能在只有部分实验产物的机器上运行。
+输入口径与现行数据合同不一致的 checkpoint 同样跳过: 条件通道表一变, 旧权重的第一层就不再是
+同一个形状, 装不回去是合同变更的必然结果, 报为失败只会把真正的结构漂移淹掉。
 
 用法:
     python -m era5_daymet.tests.test_model_contracts
@@ -38,6 +40,16 @@ def _args_of(ck):
     return a if isinstance(a, dict) else vars(a)
 
 
+def _spec_ok(path, a):
+    """checkpoint 记录的 ERA5 输入变量表是否仍是现行合同; 不是则跳过并写明差异。"""
+    got = list(a.get("in_vars", []))
+    if got == list(TD.DEFAULT_IN):
+        return True
+    print(f"  [SKIP] {path}  输入口径不符: checkpoint 记 {len(got)} 个 ERA5 动态输入, "
+          f"现行合同 {len(TD.DEFAULT_IN)} 个")
+    return False
+
+
 def _weights(ck):
     sd = ck.get("model", ck.get("state_dict"))
     return {(k[7:] if k.startswith("module.") else k): v for k, v in sd.items()}
@@ -57,7 +69,9 @@ def test_vit(path, expect_params):
         return
     from era5_daymet.models.vit import ViT
     a, sd = _args_of(ck), _weights(ck)
-    cin = TD.cond_channels(a["in_vars"], a["out_vars"], a.get("use_clim", False))
+    if not _spec_ok(path, a):
+        return
+    cin = TD.cond_channels(a["in_vars"])
     m = ViT(cin, len(a["out_vars"]), img=a["patch"], patch=a["vit_patch"], dim=a["dim"],
             depth=a["depth"], heads=a["heads"], mlp=a["mlp"], pos_type=a["pos_type"],
             head_up=a["head_up"], full_frame=a["full_frame"])
@@ -78,7 +92,9 @@ def test_regressor(path):
     if ck is None:
         return
     a, sd = _args_of(ck), _weights(ck)
-    cin = TD.cond_channels(a["in_vars"], a["out_vars"], a.get("use_clim", False))
+    if not _spec_ok(path, a):
+        return
+    cin = TD.cond_channels(a["in_vars"])
     m = TD.build_regressor(cin, len(a["out_vars"]), a)
     try:
         m.load_state_dict(sd, strict=True)

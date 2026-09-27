@@ -23,7 +23,8 @@ from era5_daymet.models.corrdiff_loss import ResidualLoss
 from era5_daymet.models.patching import RandomPatching2D
 from era5_daymet.models.preconditioning import EDMPrecondSuperResolution
 from era5_daymet.training import train_downscale as TD
-from era5_daymet.training.stage_b_mean import CachedRegressionMean, pin_ocean
+from era5_daymet.training.stage_b_mean import (CachedRegressionMean, pin_ocean,
+                                               stage_b_cond_channels)
 
 
 def build(target, img_shape, device, model_channels, p_mean, p_std, sigma_data):
@@ -31,7 +32,7 @@ def build(target, img_shape, device, model_channels, p_mean, p_std, sigma_data):
     # 为每个 patch 取出对应的那一块。传 patch 尺寸会让索引越界(表现为 GPU 非法访存)。
     ti = TD.TARGETS.index(target)
     net = EDMPrecondSuperResolution(
-        img_resolution=list(img_shape), img_in_channels=41 + 100, img_out_channels=1,
+        img_resolution=list(img_shape), img_in_channels=stage_b_cond_channels(n_grid=100), img_out_channels=1,
         model_type="SongUNetPosEmbd", model_channels=model_channels,
         channel_mult=[1, 2, 2], attn_resolutions=[16],
         N_grid_channels=100, gridtype="learnable").to(device)

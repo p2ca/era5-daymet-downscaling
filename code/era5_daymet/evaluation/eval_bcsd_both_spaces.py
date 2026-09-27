@@ -7,7 +7,7 @@ eval_bcsd_both_spaces.py — 把 BCSD 的降水成绩同时给出两个空间的
 背景:
   降水被两套代码在两种空间评测过, RMSE 之间没有换算关系, 跨空间比较 = 假结论。
     train_statistical.py (BCSD)          -> log1p(mm)
-    eval_all_methods.py / train_unet.py  -> 原生 m/day
+    统一评测管线 / train_unet.py  -> 原生 m/day
   于是 BCSD 至今无法与 UNet/ViT/插值 在降水上同台。
 
 本脚本做的事:
@@ -15,7 +15,7 @@ eval_bcsd_both_spaces.py — 把 BCSD 的降水成绩同时给出两个空间的
   2. 在 test_year 上同时评测两个空间:
        - log1p(mm): 与原实验对齐 (自检: bcsd 应复现 0.5453)
        - m/day    : 把 log 空间的预测用 expm1 反变换回物理量, 再与原始 Daymet 比
-                    (自检: bilinear-raw 应复现 eval_all_methods 的 0.0046)
+                    (自检: bilinear-raw 应复现统一管线的 0.0046)
   ★两个自检都对上, 才能证明反变换口径没错、数字可以并排。
 
 用法:
@@ -137,7 +137,7 @@ def main():
             LOG["bicubic"].add(_bicubic(lrf_log[t])[mask], mk_t)
 
         # --- m/day 空间 ---
-        RAW["bilinear_raw"].add(x_raw[mask], mk_r)                 # 直接上采样原生量(= eval_all_methods 口径)
+        RAW["bilinear_raw"].add(x_raw[mask], mk_r)                 # 直接上采样原生量(= 统一管线口径)
         RAW["bilinear_viaLog"].add(inv(x_log)[mask], mk_r)         # 先 log 再上采样再反变换(BCSD 管线口径)
         RAW["bcsd"].add(inv(bcsd_log)[mask], mk_r)                 # ★BCSD 反变换回 m/day
         if _zoom is not None:
@@ -169,7 +169,7 @@ def main():
     c2 = res["m/day"]["bilinear_raw"]["rmse"]
     hit2 = abs(c2 - 0.0046) < 0.0002
     ok &= hit2
-    print(f"  m/day  bilinear RMSE = {c2:.4f}   期望 0.0046 (eval_all_methods)   {'✓ 复现' if hit2 else '✗ 对不上'}")
+    print(f"  m/day  bilinear RMSE = {c2:.4f}   期望 0.0046 (统一管线)   {'✓ 复现' if hit2 else '✗ 对不上'}")
     print(f"\n  => {'两个自检都通过, BCSD 的 m/day 数字可以与 UNet/ViT 并排' if ok else '★自检未过, 不要使用这些数字'}")
     print(f"\n-> {a.out}/metrics_both_spaces.json   ({time.time()-t0:.0f}s)")
 

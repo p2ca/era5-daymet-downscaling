@@ -181,7 +181,7 @@ class EDM:
 def estimate_kappa(args, device=None):
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
     data = TD.DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year],
-                            args.in_vars, args.out_vars, stats, use_clim=getattr(args, "use_clim", False))
+                            args.in_vars, args.out_vars, stats)
     y = args.test_year
     days = list(range(0, data.ndays[y], max(1, data.ndays[y] // 12)))
     shared = [v for v in args.out_vars if v in args.in_vars]
@@ -374,7 +374,7 @@ def train_generator(gen, corrector, edm, dl, va_dl, args, device, is_dist, local
 def evaluate_scd(corrector, gen, edm, stats, args, device, k, Cout, use_sigma):
     from era5_daymet.evaluation import eval_common as EC
     test = TD.DownscaleData(args.era5_dir, args.daymet_dir, [args.test_year],
-                            args.in_vars, args.out_vars, stats, use_clim=getattr(args, "use_clim", False))
+                            args.in_vars, args.out_vars, stats)
     corrector.eval(); gen.eval(); y = args.test_year
     days = list(range(0, test.ndays[y], args.eval_stride))
     dstd = stats.d_std[:, None, None]; dmean = stats.d_mean[:, None, None]
@@ -416,7 +416,7 @@ def run(args):
 
     stats = TD.Stats(args.stats_dir, args.in_vars, args.out_vars)
     Cout = len(args.out_vars)
-    Cin = TD.cond_channels(args.in_vars, args.out_vars, getattr(args, "use_clim", False))  # 默认20; --use-clim=23
+    Cin = TD.cond_channels(args.in_vars)                                # 规范口径 21 通道
     k = args.kappa_factor
     use_sigma = not args.no_sigma_cond
 
@@ -434,7 +434,7 @@ def run(args):
     dl = va_dl = None
     if need_train:
         data = TD.DownscaleData(args.era5_dir, args.daymet_dir, args.train_years,
-                                args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
+                                args.in_vars, args.out_vars, stats)
         ds = TD.PatchDS(data, args.patch, args.steps_per_epoch * args.batch, seed=1234 + rank)
         dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, num_workers=args.workers,
                                          drop_last=True, pin_memory=True, worker_init_fn=TD.ds_worker_init)
@@ -443,7 +443,7 @@ def run(args):
         #   盲跑 40 轮等于故意存一个退化的模型。
         if args.val_steps > 0:
             va_data = TD.DownscaleData(args.era5_dir, args.daymet_dir, args.val_years,
-                                       args.in_vars, args.out_vars, stats, use_clim=args.use_clim)
+                                       args.in_vars, args.out_vars, stats)
             # 逐 epoch 固定 + 按 rank 分片(同 train_downscale 口径): 各卡评不同 patch, 墙钟不变
             va_ds = TD.PatchDS(va_data, args.patch, args.val_steps * args.batch, seed=987, deterministic=True,
                                index_offset=rank * args.val_steps * args.batch)
@@ -504,8 +504,6 @@ def main():
     p.add_argument("--stats-dir", default="stats_train")
     p.add_argument("--in-vars", nargs="+", default=TD.DEFAULT_IN)
     p.add_argument("--out-vars", nargs="+", default=TARGETS)
-    p.add_argument("--use-clim", action="store_true",
-                   help="保留 3 个逐日气候态条件通道 -> 23 通道(旧口径); 默认关=20 通道(指南口径)")
     p.add_argument("--train-years", type=int, nargs="+", default=M.splits["train"],
                    help="默认 1980-2017 全训练集; 内存紧张可自行缩小")
     p.add_argument("--val-years", type=int, nargs="+", default=M.splits["val"],

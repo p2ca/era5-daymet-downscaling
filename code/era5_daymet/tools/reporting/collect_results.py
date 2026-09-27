@@ -17,7 +17,7 @@ collect_results.py — 扫描 runs/exp/*/meta.json, 生成 runs/STATUS.md 与 ru
 因此不会与实现漂移; era5_daymet.tests.test_spec_contract 另行断言这些常量本身没被改动。
 
 核心约束: 指标按 units 分组输出。降水在两种空间评测过
-(train_statistical=log1p(mm), eval_all_methods=m/day), 两者 RMSE 不通约,
+(train_statistical=log1p(mm), 统一评测管线=m/day), 两者 RMSE 不通约,
 所以本脚本绝不把它们并进同一张表 —— 不同单位 = 不同表。
 ============================================================================
 """
@@ -29,6 +29,7 @@ import time
 from collections import defaultdict
 
 from era5_daymet.paths import PROJECT_ROOT
+from era5_daymet.tools.reporting.model_names import model_id, cheatsheet_lines
 
 ROOT = os.fspath(PROJECT_ROOT)
 EXP = os.path.join(ROOT, "runs", "exp")
@@ -61,16 +62,45 @@ def load_metas():
     return metas
 
 
+LEGACY_CONTRACT = "6x-era5_daymet"      # 上一代包的实验 meta 没有 contract 字段
+
+
+def contract_of(m):
+    """实验所属的数据合同名; 不同合同(倍率/目标网格/输入产品)的指标不可同表。"""
+    c = m.get("contract")
+    name = c.get("name") if isinstance(c, dict) else None
+    return name or LEGACY_CONTRACT
+
+
+def input_of(m):
+    """条件输入产品: 缺省是真实 ERA5; oracle 一类的泄漏输入必须在表里显式可见。"""
+    return m.get("input_product") or "era5"
+
+
+def unit_of(units, var):
+    """meta 的 units 有两种写法: 按变量名, 或按量纲类别(temperature / precip_physical)。"""
+    if not isinstance(units, dict):
+        return "?"
+    u = units.get(var)
+    if u:
+        return u
+    if var == PRECIP_VAR:
+        return units.get("precip_physical") or "?"
+    if var.startswith("2m_temperature"):
+        return units.get("temperature") or "?"
+    return "?"
+
+
 def flatten(m):
     """meta.key_metrics 有两种形状: {var: metrics} 或 {var: {method: metrics}}。
     统一摊平成 (var, method, metrics, unit) 四元组。"""
     out = []
     km = m.get("key_metrics", {}) or {}
-    units = m.get("units", {}) or {}
+    units = m.get("units") or m.get("unit") or {}
     for var, val in km.items():
         if not isinstance(val, dict):
             continue
-        unit = units.get(var, "?")
+        unit = unit_of(units, var)
         if any(k in val for k in COLS):                 # {var: metrics}
             out.append((var, m["method"], val, unit))
         else:                                            # {var: {method: metrics}}
@@ -97,17 +127,20 @@ def build(metas):
 
     # ---- 1. 实验清单 ----
     L.append("## 实验清单\n")
-    L.append("| 实验 ID | 方法 | 状态 | 机时 | 一句话结论 |")
-    L.append("|---|---|---|---|---|")
+    L.append("| 实验 ID | 方法 | 输入 | 状态 | 机时 | 一句话结论 |")
+    L.append("|---|---|---|---|---|---|")
     for m in metas:
-        L.append("| `{}` | {} | {} | {} | {} |".format(
-            m["_dir"], m.get("method", "?"), m.get("status", "?"),
+        mid = model_id(m.get("method"), m.get("target"))
+        meth = f"{mid} · {m.get('method', '?')}" if mid else m.get("method", "?")
+        L.append("| `{}` | {} | {} | {} | {} | {} |".format(
+            m["_dir"], meth, input_of(m), m.get("status", "?"),
             m.get("elapsed", "—"), m.get("headline", "")))
     L.append("")
 
-    # ---- 2. 指标: 按 (变量, 单位) 分组 ----
-    # 同一变量若有多个单位空间 -> 拆成多张表, 并明确警告不可跨表比较
-    groups = defaultdict(list)   # (var, unit) -> [(exp_id, method, metrics)]
+    # ---- 2. 指标: 按 (合同, 变量, 单位) 分组 ----
+    # 不同合同(空间倍率/目标网格/输入产品)的实验不可同表; 同一变量若有多个单位空间
+    # 也拆成多张表, 并明确警告不可跨表比较
+    groups = defaultdict(list)   # (contract, var, unit) -> [(exp_id, method, metrics)]
     for m in metas:
         # 只有 status=done 的实验进对照表。发散/取消的跑, 其指标来自不该被引用的检查点
         # (例: 20260712-vit-d384 的指标出自 ep1 的 ckpt), 与真 baseline 并排会得出假结论。
@@ -117,39 +150,56 @@ def build(metas):
         # 集合方法与确定性方法同表, 必须带上成员数: 集合平均本身就压 RMSE, 不标出来会被误读成模型更强
         ens = (m.get("eval") or {}).get("ensemble", 1)
         ssim = m.get("ssim") or {}
+        mid = model_id(m.get("method"), m.get("target"))
         for var, meth, mm, unit in flatten(m):
             # ssim 块只描述本实验自己的方法; 一次跑多方法时(如 BCSD 那次带了插值对照)
             # 不能把它套到别的方法行上
-            ss = (ssim.get(var) or {}).get("ssim") if meth == m.get("method") else None
-            groups[(var, unit)].append((m["_dir"], meth, mm, ens, ss))
+            own = meth == m.get("method")
+            ss = (ssim.get(var) or {}).get("ssim") if own else None
+            disp = f"{mid} · {meth}" if (mid and own) else meth
+            groups[(contract_of(m), var, unit)].append((m["_dir"], disp, mm, ens, ss))
 
-    var_units = defaultdict(set)
-    for (var, unit) in groups:
-        var_units[var].add(unit)
+    contracts = defaultdict(lambda: defaultdict(set))   # contract -> var -> {unit}
+    for (contract, var, unit) in groups:
+        contracts[contract][var].add(unit)
+    # 同一合同下若混有不同输入产品, 也要在表头点明
+    inputs_of = defaultdict(set)
+    for m in metas:
+        if m.get("status") == "done":
+            inputs_of[contract_of(m)].add(input_of(m))
 
     L.append("## 指标对照\n")
-    L.append("按 **(变量, 单位)** 分组。**不同单位的表之间不可比较** —— "
-             "降水在 log1p(mm) 与 m/day 两种空间都评测过, RMSE 之间没有换算关系。\n")
+    L.append("按 **(合同, 变量, 单位)** 分组。**不同合同的表之间不可比较**(空间倍率、目标网格"
+             "或输入产品不同); **不同单位的表之间不可比较** —— 降水在 log1p(mm) 与 m/day "
+             "两种空间都评测过, RMSE 之间没有换算关系。\n")
 
-    for var in sorted(var_units):
-        units = sorted(var_units[var])
-        for unit in units:
-            rows = groups[(var, unit)]
-            if not rows:
-                continue
-            title = f"### {var}  [{unit}]"
-            if len(units) > 1:
-                title += f"   ⚠️ 本变量有 {len(units)} 种单位空间, 仅可在本表内部比较"
-            L.append(title + "\n")
-            L.append("| 方法 | 成员数 | RMSE | MAE | bias | corr | SSIM | 来源实验 |")
-            L.append("|---|---|---|---|---|---|---|---|")
-            # 去重: 同 (方法) 若多个实验给出, 全列出(便于交叉核对)
-            for exp_id, meth, mm, ens, ss in sorted(rows, key=lambda r: (r[1], r[0])):
-                L.append("| {} | {} | {} | {} | {} | {} | {} | `{}` |".format(
-                    meth, ens, fmt(mm.get("rmse")), fmt(mm.get("mae")),
-                    fmt(mm.get("bias")), fmt(mm.get("corr")), fmt(ss), exp_id))
-            L.append("> 成员数 >1 的行是集合均值上的指标; 与成员数 1 的确定性方法并排看时, "
-                     "集合平均本身就会压低 RMSE。\n")
+    for contract in sorted(contracts):
+        head = f"### 合同 {contract}"
+        leaky = sorted(i for i in inputs_of[contract] if i != "era5")
+        if leaky:
+            head += (f"   ⚠️ 输入产品 {', '.join(leaky)}: 含同日目标信息(信息上限诊断), "
+                     "不与真实输入的表比较")
+        L.append(head + "\n")
+        var_units = contracts[contract]
+        for var in sorted(var_units):
+            units = sorted(var_units[var])
+            for unit in units:
+                rows = groups[(contract, var, unit)]
+                if not rows:
+                    continue
+                title = f"#### {var}  [{unit}]"
+                if len(units) > 1:
+                    title += f"   ⚠️ 本变量有 {len(units)} 种单位空间, 仅可在本表内部比较"
+                L.append(title + "\n")
+                L.append("| 方法 | 成员数 | RMSE | MAE | bias | corr | SSIM | 来源实验 |")
+                L.append("|---|---|---|---|---|---|---|---|")
+                # 去重: 同 (方法) 若多个实验给出, 全列出(便于交叉核对)
+                for exp_id, meth, mm, ens, ss in sorted(rows, key=lambda r: (r[1], r[0])):
+                    L.append("| {} | {} | {} | {} | {} | {} | {} | `{}` |".format(
+                        meth, ens, fmt(mm.get("rmse")), fmt(mm.get("mae")),
+                        fmt(mm.get("bias")), fmt(mm.get("corr")), fmt(ss), exp_id))
+                L.append("> 成员数 >1 的行是集合均值上的指标; 与成员数 1 的确定性方法并排看时, "
+                         "集合平均本身就会压低 RMSE。\n")
 
     # ---- 3. 待办/缺口 ----
     gaps = [(m["_dir"], m["gap"]) for m in metas if m.get("gap")]
@@ -163,31 +213,53 @@ def build(metas):
 
 
 def spec_contract():
-    """把固定数据合同从实现里读出来, 而不是抄一遍。任何一处改了实现, 本表随之改变。"""
-    from era5_daymet.data import match_era5_daymet as M
-    from era5_daymet import contract as C
+    """把固定数据合同从实现里读出来, 而不是抄一遍。任何一处改了实现, 本表随之改变。
 
-    sp = {k: (f"{v[0]}–{v[-1]}" if len(v) > 1 else str(v[0])) for k, v in M.splits.items()}
-    n_cond = C.cond_channels(C.DEFAULT_IN, C.TARGETS, use_clim=False)
+    主段取★在建的 4× 线★(downscaling_4x.contract); 冻结的 6× 线只保留一行对照, 因为
+    它的实验仍在基线表与流水里, 读者需要知道那些行属于另一套合同。
+    """
+    from downscaling_4x.data import match_era5_daymet as M4
+    from downscaling_4x import contract as C4
+    from era5_daymet import contract as C6
+
+    sp = {k: (f"{v[0]}–{v[-1]}" if len(v) > 1 else str(v[0])) for k, v in M4.splits.items()}
+    n_by_mode = {k: len(C4.ERA5_IN) * (1 + len(v[0])) + len(C4.STATIC_ORDER) + len(C4.TIME_ORDER)
+                 for k, v in C4.MODES.items()}
     pm = {}
     if os.path.exists(STATS_META):
         with open(STATS_META) as f:
             pm = json.load(f)
-    clip = pm.get("precip_clip", 0.1)
-    scale = pm.get("precip_scale", 1000.0)
+    clip = pm.get("precip_clip", C4.PRECIP_CLIP_MM)
+    scale = pm.get("precip_scale", C4.PRECIP_SCALE)
+    n_dyn, n_lag = len(C4.ERA5_IN), len(C4.HISTORY_LAGS)
+    nd = n_by_mode[C4.DEFAULT_MODE]
 
     L = ["## 1. 数据合同（派生自代码常量, 非手写）\n",
-         "| 项 | 固定值 |", "|---|---|",
-         f"| 空间倍率 | ERA5 双线性上采样 {C.FACTOR}× |",
-         f"| 条件输入 | **{n_cond} 通道** = {len(C.DEFAULT_IN)} ERA5 动态 + 3 Daymet 静态"
-         f"(Δz / landcover / land_sea_mask); 无气候态 |",
-         f"| 预测目标 | {', '.join(C.TARGETS)} |",
-         f"| 数据划分 | train {sp['train']} / val {sp['val']} / test {sp['test']}; 365 天历 |",
+         "> 主段是★在建的 4× 线★ `downscaling_4x/contract.py`; 6× 线 `era5_daymet/` 已冻结,",
+         "> 只读既有结果。基线表与流水里两条线的实验并存, **跨线的指标不可比**"
+         f"(目标网格 {C6.FACTOR * 120}×{C6.FACTOR * 240} vs {C4.HR_SHAPE[0]}×{C4.HR_SHAPE[1]}),",
+         "> 每个实验属于哪条线看 `meta.json` 的 `contract` 字段。\n",
+         "| 项 | 固定值（4× 线） |", "|---|---|",
+         f"| 空间倍率 | ERA5 {C4.LR_SHAPE[0]}×{C4.LR_SHAPE[1]} → Daymet "
+         f"{C4.HR_SHAPE[0]}×{C4.HR_SHAPE[1]}, {C4.FACTOR}× |",
+         f"| 条件输入 | 三档 `--mode`: "
+         + "; ".join(f"**{k} = {v} 通道**" for k, v in n_by_mode.items()) + f"; 缺省 {C4.DEFAULT_MODE} |",
+         f"| 通道布局 | {n_dyn} ERA5 动态 ×(1 当天 + {n_lag} 历史 t−"
+         + "/t−".join(str(x) for x in C4.HISTORY_LAGS) + ")"
+         f" + {len(C4.STATIC_ORDER)} Daymet 静态({' / '.join(C4.STATIC_ORDER)})"
+         f" + {len(C4.TIME_ORDER)} 时间({' / '.join(C4.TIME_ORDER)}); 无气候态, 不注入位置平面 |",
+         f"| 预测目标 | {', '.join(C4.TARGETS)} |",
+         f"| 数据划分 | train {sp['train']} / val {sp['val']} / test {sp['test']};"
+         f" {C4.DAYS_PER_YEAR} 天历 |",
          f"| 降水管线 | ×{scale:g} → mm → <{clip:g} mm 置零 → log1p → z-score;"
-         f" 反变换 expm1 并钳到 log1p ≤ {C.PRECIP_LOG_MAX:g} |",
-         "| 掩膜 | 只在陆地算 loss 与指标 |", "",
-         "**ERA5 动态输入必须严格按此顺序读取**（`era5_daymet/contract.py` 的 `DEFAULT_IN`）:\n",
-         "```", *(f"{i:2d}. {v}" for i, v in enumerate(C.DEFAULT_IN, 1)), "```", "",
+         f" 反变换 expm1 并钳到 log1p ≤ {C4.PRECIP_LOG_MAX:g} |",
+         f"| 有效域 | {C4.EFFECTIVE_DOMAIN}; 只在其上算 loss 与指标 |",
+         f"| 冻结的 6× 线 | ERA5 双线性上采样 {C6.FACTOR}×, {C6.cond_channels(C6.DEFAULT_IN)} 通道,"
+         f" 目标 {C6.FACTOR * 120}×{C6.FACTOR * 240}; 只读 |", "",
+         "**ERA5 动态输入必须严格按此顺序读取**（`downscaling_4x/contract.py` 的 `ERA5_IN`）:\n",
+         "```", *(f"{i:2d}. {v}" for i, v in enumerate(C4.ERA5_IN, 1)), "```", "",
+         "> 衡量历史通道的增量必须拿 `history_51` 比 `history_control_21`（通道数相同, 只差帧集合）;",
+         "> 比 `baseline_21` 会把\"训练集变小\"算进\"加了历史通道\", 而不会有任何东西报错。\n",
          "> 降水存在 `log1p(mm)` 与 `m/day` 两种单位空间, RMSE 之间没有换算关系, 排名甚至相反;",
          "> 任何跨方法比较前先确认单位一致。\n"]
     return L
@@ -209,6 +281,17 @@ def audit(metas):
         hp = os.path.join(d, "loss_history.json")
         tr = m.get("training") or {}
         status = str(m.get("status", ""))
+
+        # 规范名一致性: 基线标签应以 (method, target) 推导出的规范名开头, 否则同一模型
+        # 会以旧称/别名出现在基线表里, 跨表检索时静默失配
+        label = m.get("current_baseline")
+        if label:
+            mid = model_id(m.get("method"), m.get("target"))
+            if mid and not str(label).startswith(mid):
+                out.append((m["_dir"], f"current_baseline「{label}」未以规范名 {mid} 开头"))
+            # 泄漏输入(oracle)上的成绩不是基线: 登记进基线表会与真实输入的方法同框
+            if input_of(m) != "era5":
+                out.append((m["_dir"], f"输入产品 {input_of(m)} 的实验不得登记 current_baseline"))
 
         if os.path.exists(hp):
             try:
@@ -261,6 +344,10 @@ def build_status(metas):
          "> 要改内容 -> 改代码或对应 meta.json -> 重跑脚本。\n"]
     L += spec_contract()
 
+    L += ["## 1.5 模型命名（派生自 tools/reporting/model_names.py）\n"]
+    L += cheatsheet_lines()
+    L.append("")
+
     # ---- 现行确定性基线: 由 meta.json 的 current_baseline 显式登记 ----
     L.append("## 2. 现行基线（2020 测试年, 陆地, 365 天）\n")
     base = []
@@ -278,17 +365,24 @@ def build_status(metas):
 
     if base:
         for var, head in BASELINE_VARS:
-            L.append(f"### {head}\n")
             wide = var == PRECIP_VAR          # 降水两种单位空间并存, 必须逐行标单位
-            L += ["| 方法 | MAE | RMSE | SSIM | corr |" + (" 单位 |" if wide else "") + " 来源实验 |",
-                  "|---|---|---|---|---|" + ("---|" if wide else "") + "---|"]
+            rows = []
             for label, km, ssim, d in sorted(base, key=lambda r: r[0]):
                 mm, unit = km.get(var, ({}, "?"))
+                if not mm:                    # 单目标模型只在自己那个目标的表里出现
+                    continue
                 cells = [label, fmt(mm.get("mae")), fmt(mm.get("rmse")),
                          fmt((ssim.get(var) or {}).get("ssim")), fmt(mm.get("corr"))]
                 if wide:
                     cells.append(unit)
-                L.append("| " + " | ".join(cells) + f" | `{d}` |")
+                rows.append("| " + " | ".join(cells) + f" | `{d}` |")
+            L.append(f"### {head}\n")
+            if not rows:
+                L.append("_尚无实验登记本目标的 2020 指标。_\n")
+                continue
+            L += ["| 方法 | MAE | RMSE | SSIM | corr |" + (" 单位 |" if wide else "") + " 来源实验 |",
+                  "|---|---|---|---|---|" + ("---|" if wide else "") + "---|"]
+            L += rows
             L.append("")
         L += ["> 降水的 MAE/RMSE 存在 `log1p(mm)` 与 `m/day` 两种单位空间, 之间没有换算关系,",
               "> 排名甚至相反; SSIM 一律在物理空间上算, 各方法可比。\n"]
@@ -303,8 +397,10 @@ def build_status(metas):
               "|---|---|---|---|---|---|---|"]
         for m in sorted(cd, key=lambda x: str(x.get("target", x["_dir"]))):
             b = m["test_2020"]["bigcheck_365d"]
+            mid = model_id(m.get("method"), m.get("target"))
+            tgt = m.get("target", m.get("headline", "")[:24])
             L.append("| {} | {} | {} | {} | {} | {} | `{}` |".format(
-                m.get("target", m.get("headline", "")[:24]), m["model_version"],
+                f"{mid} · {tgt}" if mid else tgt, m["model_version"],
                 fmt(b.get("crps_ens")), fmt(b.get("mae_mu")), fmt(b.get("crpss")),
                 fmt(b.get("rmse_ens_mean")), m["_dir"]))
         L.append("")
@@ -333,9 +429,7 @@ def build_status(metas):
     L += ["## 4. 更细的东西去哪查\n",
           f"- 全部 {len(metas)} 个实验的流水与指标对照（含 {n_sup} 个 superseded）: `runs/LEDGER.md`",
           "- 某次实验的完整命令、参数、逐项指标: `runs/exp/<id>/meta.json`",
-          "- 重大实验与协议变更的时间线: `docs/HISTORY.md`",
-          "- 学长下发的完整规范（CorrDiff 调参表、验收清单）: `docs/reference/instruction.html`",
-          "- 集群、分区、环境事实: `docs/reference/ornl-environment.md`", ""]
+          "- 规范、协议变更时间线与集群环境事实: 工作区 `docs/` 目录下的项目文档", ""]
     return "\n".join(L)
 
 

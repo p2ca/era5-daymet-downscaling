@@ -26,6 +26,8 @@ from typing import Callable, Optional
 import torch
 from torch import Tensor
 
+from era5_daymet.contract import TIME_ORDER
+from era5_daymet.models.corrdiff_loss import _global_context
 from era5_daymet.models.patching import GridPatching2D
 
 
@@ -97,6 +99,7 @@ def stochastic_sampler(
     S_min: float = 0,
     S_max: float = float("inf"),
     S_noise: float = 1,
+    n_constant_cond: Optional[int] = None,
 ) -> Tensor:
     r"""
     Proposed EDM sampler (Algorithm 2) with minor changes to enable
@@ -245,7 +248,10 @@ def stochastic_sampler(
         # Patched conditioning [x_lr, mean_hr]
         # (batch_size * patch_num, C_in + C_out, patch_shape_y, patch_shape_x)
         x_lr = _apply_wrapper_Cin_channels(
-            patching=patching, input=x_lr, additional_input=img_lr
+            patching=patching, input=x_lr,
+            additional_input=_global_context(
+                img_lr,
+                len(TIME_ORDER) if n_constant_cond is None else n_constant_cond),
         )
 
         # Function to select the correct positional embedding for each patch
